@@ -55,6 +55,7 @@ Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLIC
 Environment: CONFIG=/path/to/config.json
 Example (with defaults)
 
+'''python
 {
   "JOB_NAMES": ["QA Automation"],
   "LOCATIONS": ["poland-remote", "remote"],
