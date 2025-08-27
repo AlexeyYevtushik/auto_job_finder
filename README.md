@@ -14,6 +14,8 @@ Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, colle
 
 ### Prereqs:
 
+```markdown
+```bash
 python -m venv .venv
 
 #### Windows: 
@@ -55,7 +57,8 @@ Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLIC
 Environment: CONFIG=/path/to/config.json
 Example (with defaults)
 
-'''python
+```markdown
+```json
 {
   "JOB_NAMES": ["QA Automation"],
   "LOCATIONS": ["poland-remote", "remote"],
