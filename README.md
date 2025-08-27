@@ -14,25 +14,21 @@ Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, colle
 ### Prereqs:
 
 ```markdown
-```bash
 python -m venv .venv
 ```
 
 #### Windows: 
 ```markdown
-```bash
 .venv\Scripts\activate
 ```
 
 #### macOS/Linux:
 ```markdown
-```bash
 source .venv/bin/activate
 ```
 #### then...
 
 ```markdown
-```bash
 pip install -r requirements.txt
 playwright install --with-deps
 ```
@@ -43,7 +39,6 @@ Initializes state.json - (READY)
 
 ### Run:
 ```markdown
-```bash
 python -m src.s1_prepare
 ```
 ## S2:
@@ -52,7 +47,6 @@ Appends only new URLs to data/links.jsonl (URL-based dedupe).
 
 ### Run:
 ```markdown
-```bash
 python -m src.s2_collect_links
 ```
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
@@ -63,7 +57,6 @@ Environment: CONFIG=/path/to/config.json
 Example (with defaults)
 
 ```markdown
-```json
 {
   "JOB_NAMES": ["QA Automation"],
   "LOCATIONS": ["poland-remote", "remote"],
@@ -78,7 +71,6 @@ Example (with defaults)
 
 ## Data formats (JSONL)
 ```markdown
-```json
 {"id":"jj-12","data_index":"12","job_name":"QA Automation","location":"remote","url":"https://justjoin.it/job-offer/...","new_href":true}
 {"id":"jj-13","data_index":"13","job_name":"QA Automation","location":"poland-remote","url":"https://justjoin.it/job-offer/...","new_href":true}
 ```
@@ -105,9 +97,6 @@ Example (with defaults)
 ## Status:
 
 S1 — Ready
-
 S2 — Ready
-
 S3 — WIP (updated daily)
-
 S4 — WIP (updated daily)
