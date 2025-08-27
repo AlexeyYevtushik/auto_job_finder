@@ -2,14 +2,13 @@
 
 ## Work Find Agent
 
-A minimal, modular pipeline (S1–S4) for job discovery.
-Today it works with JustJoin with your Google Account (for JustJoin account is created).
+Minimal agent that can work with 1000th of vacansies, finds appropriate vacations for you, Applying by you for Easy Apply, Works with browser_use with others vacansies
 
 ## S1
-Prepare / Seed (READY): bootstrap folders & state, verify base URL, warm Playwright storage.
+Prepare / Seed (READY): bootstrap folders & state, warm Playwright storage.
 
 ## S2
-Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, human-like no-click scrolling, collect unique job URLs into data/links.jsonl.
+Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, collect unique job URLs into data/links.jsonl.
 
 ## How to run S1 and S2 
 
