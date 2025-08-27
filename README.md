@@ -34,39 +34,54 @@ playwright install --with-deps
 
 
 ## S1:
-Initializes state.json (e.g., base_url) and storage_state.json (Playwright auth/cookies) for other scripts run. Need to run only once or if you need to relogin. (READY)
+Initializes state.json - (READY)
+(e.g., base_url) and storage_state.json (Playwright auth/cookies) for other scripts run. Need to run only once or if you need to relogin.
 
 ### Run:
 
 python -m src.s1_prepare
 
 ## S2:
-Collect Links (READY). Appends only new URLs to data/links.jsonl (URL-based dedupe).
+Collect Links (READY). 
+Appends only new URLs to data/links.jsonl (URL-based dedupe).
 
 ### Run:
 
 python -m src.s2_collect_links
 
-sample output:
+#### sample output:
+
 [INFO] Open search: https://justjoin.it/job-offers/remote?keyword=QA+Automation  (job='QA Automation', location='remote')
+
 [OK] Added 17 NEW hrefs to data/links.jsonl. Total known hrefs: 42
 
 
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
 
-3) Configuration
+## Configuration
+   
 Environment: CONFIG=/path/to/config.json
+
 Example (with defaults)
 
 {
+
   "JOB_NAMES": ["QA Automation"],
+  
   "LOCATIONS": ["poland-remote", "remote"],
+  
   "HEADFUL": true,
+  
   "TARGET_INDEXES": 1000,
+  
   "FAIL_FAST": true,
+  
+
 
   "ALLOW_COOKIE_CLICK": false,
+  
   "ALLOW_LOAD_MORE_CLICK": false
+  
 }
 
 
