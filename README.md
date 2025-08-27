@@ -49,46 +49,26 @@ Appends only new URLs to data/links.jsonl (URL-based dedupe).
 
 python -m src.s2_collect_links
 
-#### sample output:
-
-[INFO] Open search: https://justjoin.it/job-offers/remote?keyword=QA+Automation  (job='QA Automation', location='remote')
-
-[OK] Added 17 NEW hrefs to data/links.jsonl. Total known hrefs: 42
-
-
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
 
 ## Configuration
    
 Environment: CONFIG=/path/to/config.json
-
 Example (with defaults)
 
 {
-
   "JOB_NAMES": ["QA Automation"],
-  
   "LOCATIONS": ["poland-remote", "remote"],
-  
   "HEADFUL": true,
-  
   "TARGET_INDEXES": 1000,
-  
   "FAIL_FAST": true,
-  
-
-
   "ALLOW_COOKIE_CLICK": false,
-  
   "ALLOW_LOAD_MORE_CLICK": false
-  
 }
 
 
 
-Data formats (JSONL)
-
-data/links.jsonl (S2 output — new URLs only)
+## Data formats (JSONL)
 
 {"id":"jj-12","data_index":"12","job_name":"QA Automation","location":"remote","url":"https://justjoin.it/job-offer/...","new_href":true}
 {"id":"jj-13","data_index":"13","job_name":"QA Automation","location":"poland-remote","url":"https://justjoin.it/job-offer/...","new_href":true}
@@ -96,15 +76,25 @@ data/links.jsonl (S2 output — new URLs only)
 
 Directory layout
 .
+
 ├─ config/
+
 │  └─ config.json
+
 ├─ data/
+
 │  ├─ links.jsonl          # S2 output
+
 │  ├─ jobs.jsonl           # S3 output
+
 │  └─ export.(jsonl|csv|md)# S4 output
+
 ├─ errors/                 # time-stamped .txt diagnostics
+
 ├─ screens/                # time-stamped screenshots
+
 ├─ src/
+
 │  ├─ s1_prepare.py
 │  ├─ s2_collect_links.py
 │  ├─ s3_scrape_details.py
