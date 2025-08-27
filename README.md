@@ -14,14 +14,20 @@ S2 — Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION
 2) How to run S1 and S2 
 
 Prereqs:
+
 python -m venv .venv
+
 Windows: 
+
 .venv\Scripts\activate
 
+
 macOS/Linux:
+
 source .venv/bin/activate
 
 pip install -r requirements.txt
+
 playwright install --with-deps
 
 
