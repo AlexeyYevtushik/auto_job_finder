@@ -15,20 +15,22 @@ Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, human
 
 ### Prereqs:
 
-### python -m venv .venv
+python -m venv .venv
 
-### Windows: 
+#### Windows: 
 
-### .venv\Scripts\activate
+.venv\Scripts\activate
 
 
-### macOS/Linux:
+#### macOS/Linux:
 
-### source .venv/bin/activate
+source .venv/bin/activate
 
-### pip install -r requirements.txt
+#### then...
 
-### playwright install --with-deps
+pip install -r requirements.txt
+
+playwright install --with-deps
 
 
 ## S1:
