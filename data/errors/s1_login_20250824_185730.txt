@@ -1,0 +1,11 @@
+TIME: 2025-08-24T16:57:32.922726+00:00
+SCRIPT: s1_login
+STEP: login_and_save
+
+TRACEBACK:
+Traceback (most recent call last):
+  File "C:\Repo\auto_job_finder\src\s1_login_save.py", line 26, in main
+    if not is_logged_in(page):
+           ^^^^^^^^^^^^
+NameError: name 'is_logged_in' is not defined
+

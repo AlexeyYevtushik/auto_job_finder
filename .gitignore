@@ -1,0 +1,8 @@
+\data\errors
+\data\screenshots
+\data\easy_apply_log.jsonl
+\data\filtered_links.jsonl
+\data\links.jsonl
+\.mypy_cache
+\.venv
+\src\__pycache__

@@ -1,0 +1,10 @@
+{
+  "JOB_NAMES": ["QA Automation"], 
+  "LOCATIONS": ["remote", "poland-remote"],
+  "HEADFUL": true,
+  "TARGET_INDEXES": 1000,
+  "FAIL_FAST": true,
+  "ALLOW_COOKIE_CLICK": true,
+  "KEYWORDS":["Playwright","Python","JavaScript/TypeScript"],
+  "INTRODUCE_YOURSELF":": "\nGithub: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/"
+}

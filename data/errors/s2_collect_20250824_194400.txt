@@ -1,0 +1,11 @@
+TIME: 2025-08-24T17:44:02.563658+00:00
+SCRIPT: s2_collect
+STEP: collect_links
+
+TRACEBACK:
+Traceback (most recent call last):
+  File "C:\Repo\auto_job_finder\src\s2_collect_links.py", line 86, in main
+    append_jsonl(
+    ^^^^^^^^^^^^
+NameError: name 'append_jsonl' is not defined
+

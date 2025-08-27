@@ -1,0 +1,8 @@
+{
+  "base_url": "https://justjoin.it/",
+  "storage_state_path": "data/storage_state.json",
+  "last_login_at": "2025-08-24T17:36:48.609782+00:00",
+  "login": {
+    "method": "manual"
+  }
+}
