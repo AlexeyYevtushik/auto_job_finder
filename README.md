@@ -74,7 +74,7 @@ Example (with defaults)
 {"id":"jj-13","data_index":"13","job_name":"QA Automation","location":"poland-remote","url":"https://justjoin.it/job-offer/...","new_href":true}
 
 
-Directory layout
+## Directory layout
 .
 
 ├─ config/
@@ -96,13 +96,18 @@ Directory layout
 ├─ src/
 
 │  ├─ s1_prepare.py
+
 │  ├─ s2_collect_links.py
+
 │  ├─ s3_scrape_details.py
+
 │  ├─ s4_enrich_export.py
+
 │  └─ common.py
+
 └─ requirements.txt
 
-Status:
+## Status:
 
 S1 — Ready
 S2 — Ready
