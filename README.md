@@ -1,6 +1,6 @@
-FROM WORKLESS TO WORKLESS
+# FROM WORKLESS TO WORKLESS
 
-Work Find Agent — README
+# Work Find Agent
 
 A minimal, modular pipeline (S1–S4) for job discovery.
 Today it works with JustJoin with your Google Account (for JustJoin account is created).
@@ -15,9 +15,10 @@ S2 — Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION
 
 Prereqs:
 python -m venv .venv
-# Windows: 
+Windows: 
 .venv\Scripts\activate
-# macOS/Linux:
+
+macOS/Linux:
 source .venv/bin/activate
 
 pip install -r requirements.txt
@@ -39,9 +40,9 @@ Run:
 
 python -m src.s2_collect_links
 
-# sample output:
-# [INFO] Open search: https://justjoin.it/job-offers/remote?keyword=QA+Automation  (job='QA Automation', location='remote')
-# [OK] Added 17 NEW hrefs to data/links.jsonl. Total known hrefs: 42
+sample output:
+[INFO] Open search: https://justjoin.it/job-offers/remote?keyword=QA+Automation  (job='QA Automation', location='remote')
+[OK] Added 17 NEW hrefs to data/links.jsonl. Total known hrefs: 42
 
 
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
