@@ -7,9 +7,11 @@ Today it works with JustJoin with your Google Account (for JustJoin account is c
 
 1) Series S1–S4.
 
-S1 — Prepare / Seed (READY): bootstrap folders & state, verify base URL, warm Playwright storage.
+#S1
+Prepare / Seed (READY): bootstrap folders & state, verify base URL, warm Playwright storage.
 
-S2 — Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, human-like no-click scrolling, collect unique job URLs into data/links.jsonl.
+#S2
+Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, human-like no-click scrolling, collect unique job URLs into data/links.jsonl.
 
 2) How to run S1 and S2 
 
@@ -32,17 +34,17 @@ playwright install --with-deps
 
 
 
-S1:
+#S1:
 Initializes state.json (e.g., base_url) and storage_state.json (Playwright auth/cookies) for other scripts run. Need to run only once or if you need to relogin. (READY)
 
-Run:
+#Run:
 
 python -m src.s1_prepare
 
-S2:
+#S2:
 Collect Links (READY). Appends only new URLs to data/links.jsonl (URL-based dedupe).
 
-Run:
+#Run:
 
 python -m src.s2_collect_links
 
