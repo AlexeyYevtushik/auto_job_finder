@@ -5,7 +5,7 @@
 # - Extracts full Job Description (JD)
 # - Runs keyword check
 # - Clicks "Apply" if keywords matched
-# - Detects if "easy apply" form is present
+# - Detects ONLY the JustJoin.it in-page "Application form" modal as easy apply
 # - Writes results into data/filtered_links.jsonl
 # - Marks a link as consumed (new_href=false) ONLY IF processing succeeded
 
@@ -18,7 +18,7 @@ from contextlib import suppress
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Union
+from typing import List, Dict, Any, Tuple, Union, Optional
 
 from playwright.async_api import (
     async_playwright, Page, Browser, BrowserContext
@@ -53,6 +53,9 @@ def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
         if t and t not in seen:
             seen.add(t); out.append(t)
     return out or DEFAULT_KEYWORDS[:]
+
+def _log(msg: str) -> None:
+    print(f"[S3] {msg}", flush=True)
 
 async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: int = 120, pause_s: float = 3.6):
     for _ in range(max_steps):
@@ -145,7 +148,46 @@ async def get_job_description_text(page: Page) -> str:
                 return t.strip()
     return ""
 
+# ---- Strict JustJoin modal detection ----
+def _is_justjoin(url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+        return host.endswith("justjoin.it")
+    except Exception:
+        return False
+
+async def detect_jj_easy_apply_modal(page: Page) -> bool:
+    """
+    True only for the JustJoin.it in-page "Application form" modal
+    shown on the SAME TAB (not external ATS).
+    """
+    if not _is_justjoin(page.url or ""):
+        return False
+
+    try:
+        dlg = page.locator("[role='dialog']")
+        if await dlg.count() == 0:
+            dlg = page.locator("div[aria-modal='true']")
+        if await dlg.count() == 0:
+            return False
+
+        has_heading = await dlg.filter(
+            has_text=re.compile(r"Application form|Formularz aplikacyjny", re.I)
+        ).count() > 0
+        has_form  = await dlg.locator("form").count() > 0
+        has_apply = await dlg.locator("button:has-text('Apply'), button:has-text('Aplikuj')").count() > 0
+
+        hint_intro = await dlg.locator("textarea[placeholder*='Introduce yourself' i]").count() > 0
+        hint_name  = await dlg.filter(has_text=re.compile(r"First and last name|Imię i nazwisko", re.I)).count() > 0
+        hint_mail  = await dlg.filter(has_text=re.compile(r"Email", re.I)).count() > 0
+
+        score = sum([has_heading, has_form, has_apply, hint_intro, (hint_name or hint_mail)])
+        return has_form and has_apply and score >= 3
+    except Exception:
+        return False
+
 async def detect_application_form(page: Page) -> bool:
+    # (kept for fallback use; not used by strict JJ modal path)
     hints = [
         "application form", "apply for this job", "apply now",
         "wyślij aplikację", "formularz aplikacyjny", "aplikuj",
@@ -238,7 +280,7 @@ async def process_one(
     try to click Apply, detect easy apply, write result.
     Returns True on success (even if keywords not matched), False on failure.
     """
-    page: Page | None = None
+    page: Optional[Page] = None
     url = row.get("url")
     if not url:
         return False
@@ -265,6 +307,7 @@ async def process_one(
             # full JD saved here
             "description_sample": desc_full,
             "processed_at": now_iso(),
+            "processed": False,  # S3 sets false by default; S4/S5 will set true later
         }
 
         if not keyword_exists:
@@ -273,9 +316,16 @@ async def process_one(
             return True
 
         # Try Apply flow
-        easy_apply, final_url = await click_apply_and_detect(ctx, page)
-        result["easy_apply"] = bool(easy_apply)
-        result["final_url"]  = final_url
+        info = await click_apply_and_detect(ctx, page)
+        result["easy_apply"] = bool(info["easy_apply"])
+        result["final_url"]  = info["final_url"]
+
+        if not info["apply_found"]:
+            # Outdated vacancy: no Apply on the page -> mark processed so S4 skips it.
+            result["processed"] = True
+            _log(f"[{row.get('id') or url}] Apply button missing -> processed=true")
+        else:
+            _log(f"[{row.get('id') or url}] mode={info['mode']} easy_apply={result['easy_apply']} final_url={result['final_url']}")
 
         append_jsonl(FILTERED_JSONL, result)
 
@@ -306,157 +356,112 @@ async def process_one(
             with suppress(Exception): await page.close()
 
 # ---------------------- CLICK APPLY + DESTINATION DETECTION ----------------------
-# (unchanged from your version; omitted here for brevity if you already have it)
-# Paste your existing click_apply_and_detect(...) here
-async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> tuple[bool, str]:
-    import re
-    candidates = [
-        re.compile(r"\bapply now?\b", re.I),
-        re.compile(r"\bapply\b", re.I),
-        re.compile(r"\baplikuj\b", re.I),
-        re.compile(r"wyślij", re.I),
-    ]
 
-    apply = None
-    for rx in candidates:
+async def find_apply_button(page: Page):
+    texts = [r"\bapply now?\b", r"\bapply\b", r"\baplikuj\b", r"\bwyślij\b"]
+    for rx in [re.compile(t, re.I) for t in texts]:
         loc = page.get_by_role("button", name=rx)
         if await loc.count() > 0:
-            apply = loc.first; break
+            return loc.first
         loc = page.get_by_role("link", name=rx)
         if await loc.count() > 0:
-            apply = loc.first; break
+            return loc.first
+    for txt in ["Apply now", "Apply", "Aplikuj", "Wyślij"]:
+        loc = page.locator(f"button:has-text('{txt}'), a:has-text('{txt}')")
+        if await loc.count() > 0:
+            return loc.first
+    return None
+
+async def _cancel_pending(tasks: List[asyncio.Task]) -> None:
+    """Cancel and drain event waiters so no 'Task exception was never retrieved' leaks."""
+    if not tasks:
+        return
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    # Drain all tasks; swallow exceptions (CancelledError, target closed, etc.)
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, Any]:
+    """
+    Returns a dict:
+      {
+        "apply_found": bool,
+        "clicked": bool,
+        "easy_apply": bool,      # True only if JJ modal on SAME TAB
+        "final_url": str,        # external ATS or current URL
+        "mode": "modal|popup|nav|none"
+      }
+    """
+    apply = await find_apply_button(page)
     if not apply:
-        for txt in ["Apply now", "Apply", "Aplikuj", "Wyślij"]:
-            loc = page.locator(f"a:has-text('{txt}')")
-            if await loc.count() > 0:
-                apply = loc.first; break
-    if not apply:
-        easy_now = await detect_application_form(page)
-        return (easy_now, page.url)
+        _log(f"[{page.url}] Apply button NOT found")
+        return {"apply_found": False, "clicked": False, "easy_apply": False, "final_url": page.url or "", "mode": "none"}
 
-    candidate_href = None
+    # Create event waiters WITHOUT timeouts; we'll poll and cancel properly.
+    t_popup_ctx  = asyncio.create_task(ctx.wait_for_event("page"))
+    t_popup_page = asyncio.create_task(page.wait_for_event("popup"))
+    t_nav        = asyncio.create_task(page.wait_for_event("framenavigated"))
+    tasks = [t_popup_ctx, t_popup_page, t_nav]
+
+    # Click
     with suppress(Exception):
-        raw_hint = await apply.evaluate(
-            """el => {
-                const root = el.closest('a') || (el.tagName.toLowerCase()==='a' ? el : null) || el;
-                const keys = ['href','data-href','data-url','data-redirect','data-link','data-external-url','data-apply-url'];
-                for (const k of keys) {
-                  const v = root.getAttribute(k);
-                  if (v && v.trim()) return v.trim();
-                }
-                const oc = root.getAttribute('onclick') || el.getAttribute('onclick');
-                if (oc) {
-                  const m = oc.match(/https?:\/\/[^\s'"]+/);
-                  if (m) return m[0];
-                }
-                const form = root.closest && root.closest('form');
-                if (form && form.action) return form.action;
-                return null;
-            }"""
-        )
-        if raw_hint:
-            candidate_href = urljoin(page.url, raw_hint)
-
-    popup_ctx_task  = asyncio.create_task(ctx.wait_for_event("page",   timeout=15000))
-    popup_page_task = asyncio.create_task(page.wait_for_event("popup", timeout=15000))
-    nav_task        = asyncio.create_task(page.wait_for_event("framenavigated", timeout=15000))
-
+        await apply.scroll_into_view_if_needed(); await apply.hover()
+    clicked = False
     with suppress(Exception):
-        await apply.scroll_into_view_if_needed()
-        await apply.hover()
-
-    did_click = False
-    with suppress(Exception):
-        box = await apply.bounding_box()
-        if box:
-            x = box["x"] + min(box["width"]  / 2 + 10, max(box["width"]  - 1, 1))
-            y = box["y"] + min(box["height"] / 2 + 10, max(box["height"] - 1, 1))
-            await page.mouse.move(x, y); await page.mouse.down(); await page.mouse.up()
-            did_click = True
-    if not did_click:
+        await apply.click(); clicked = True
+    if not clicked:
         with suppress(Exception):
-            await apply.click(timeout=8000); did_click = True
-    if not did_click:
-        with suppress(Exception):
-            await apply.evaluate("el => el.click()"); did_click = True
+            await apply.evaluate("el => el.click()"); clicked = True
+    _log(f"[{page.url}] Apply clicked={clicked}")
 
-    form_on_origin = False
-    for _ in range(12):
-        if await detect_application_form(page):
-            form_on_origin = True
-            break
-        await asyncio.sleep(0.5)
+    try:
+        # Poll up to ~8s: check for JJ modal; otherwise respond to popup/nav.
+        for _ in range(40):  # 40 * 0.2s ≈ 8s
+            # JJ modal on same tab?
+            try:
+                if await detect_jj_easy_apply_modal(page):
+                    _log(f"[{page.url}] JJ modal detected (easy_apply=True)")
+                    return {"apply_found": True, "clicked": clicked, "easy_apply": True, "final_url": page.url or "", "mode": "modal"}
+            except Exception:
+                pass
 
-    await asyncio.sleep(4)
+            # Popup?
+            if t_popup_ctx.done() or t_popup_page.done():
+                new_page: Optional[Page] = None
+                if t_popup_ctx.done():
+                    with suppress(Exception): new_page = t_popup_ctx.result()
+                if (not new_page) and t_popup_page.done():
+                    with suppress(Exception): new_page = t_popup_page.result()
 
-    target_page = None
-    for t in (popup_ctx_task, popup_page_task):
-        if t.done():
-            with suppress(Exception):
-                target_page = t.result()
-                if target_page: break
-    if not target_page:
-        with suppress(Exception):
-            target_page = await popup_ctx_task
-    if not target_page:
-        with suppress(Exception):
-            target_page = await popup_page_task
-    if not target_page:
-        with suppress(Exception):
-            await nav_task
-        target_page = page
+                if new_page:
+                    with suppress(Exception):
+                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    with suppress(Exception):
+                        await new_page.wait_for_load_state("networkidle", timeout=8000)
+                    final_url = new_page.url or ""
+                    _log(f"[{page.url}] Popup opened -> {final_url} (easy_apply=False)")
+                    return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "popup"}
 
-    with suppress(Exception):
-        await target_page.wait_for_load_state("domcontentloaded", timeout=10000)
-    with suppress(Exception):
-        await target_page.wait_for_load_state("networkidle",      timeout=8000)
+            # Same-tab navigation?
+            if t_nav.done():
+                with suppress(Exception): _ = t_nav.result()
+                with suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                with suppress(Exception):
+                    await page.wait_for_load_state("networkidle", timeout=6000)
+                final_url = page.url or ""
+                _log(f"[{final_url}] Same-tab navigation (easy_apply=False)")
+                return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "nav"}
 
-    final_url = (target_page.url or "").strip()
+            await asyncio.sleep(0.2)
 
-    def is_external(u: str) -> bool:
-        try:
-            return "justjoin.it" not in (urlparse(u).netloc or "").lower()
-        except Exception:
-            return False
+        # No modal, no popup, no nav: keep current URL
+        _log(f"[{page.url}] No modal/popup/navigation after click (easy_apply=False)")
+        return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": page.url or "", "mode": "none"}
 
-    if (target_page is page) and candidate_href and (not final_url or final_url == page.url) and is_external(candidate_href):
-        try:
-            manual = await ctx.new_page()
-            await manual.goto(candidate_href, wait_until="domcontentloaded", timeout=20000)
-            with suppress(Exception):
-                await manual.wait_for_load_state("networkidle", timeout=8000)
-            target_page = manual
-            final_url   = manual.url or candidate_href
-        except Exception:
-            final_url   = candidate_href
-
-    if (target_page is page) and (not final_url or final_url == page.url):
-        with suppress(Exception):
-            hrefs = await page.eval_on_selector_all(
-                "a[href]", "els => els.slice(0,80).map(a => a.href || a.getAttribute('href'))"
-            )
-            for h in hrefs or []:
-                if not h: continue
-                abs_h = urljoin(page.url, h)
-                if is_external(abs_h):
-                    try:
-                        manual = await ctx.new_page()
-                        await manual.goto(abs_h, wait_until="domcontentloaded", timeout=20000)
-                        with suppress(Exception):
-                            await manual.wait_for_load_state("networkidle", timeout=8000)
-                        target_page = manual
-                        final_url   = manual.url or abs_h
-                        break
-                    except Exception:
-                        final_url   = abs_h
-                        break
-
-    if not final_url:
-        final_url = page.url
-
-    form_on_target = await detect_application_form(target_page)
-    easy_apply = bool(form_on_origin or form_on_target)
-    return (easy_apply, final_url)
+    finally:
+        await _cancel_pending(tasks)
 
 # ------------------------------- Main async runner -------------------------------
 
