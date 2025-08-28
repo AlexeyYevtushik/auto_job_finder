@@ -115,6 +115,11 @@ Example (with defaults)
 ## Status:
 
 S1 — Ready
+
 S2 — Ready
-S3 — WIP (updated daily)
-S4 — WIP (updated daily)
+
+S3 — Ready
+
+S4 — Ready
+
+S5 - Next Plan
