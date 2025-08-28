@@ -3,9 +3,10 @@
   "LOCATIONS": ["remote", "poland-remote"],
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
-  "FAIL_FAST": true,
+  "FAIL_FAST": false,
   "LIMIT": 10,
   "ALLOW_COOKIE_CLICK": true,
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
+  "REQUIRE_CONFIRMATION": true,
   "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/"
 }

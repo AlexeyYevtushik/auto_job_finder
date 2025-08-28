@@ -5,10 +5,19 @@
 Minimal agent that can work with 1000th of vacansies, finds appropriate vacations for you, Applying by you for Easy Apply, Works with browser_use with others vacansies
 
 ### S1
-Prepare / Seed (READY): bootstrap folders & state, warm Playwright storage.
+Prepare / Seed (READY): Gives you to log in to JustJoin
 
 ### S2
-Collect Links (READY): open JustJoin search for each JOB_NAME × LOCATION, collect unique job URLs into data/links.jsonl.
+Collect Links (READY): Collects links to vacansies on JustJoin
+
+### S3
+Filter Links (READY): If vacancy contains one of keywords, Pressing Apply (saves new URL for real vacancy, or sets easy_apply = true)
+
+### S4
+Applying to easy_apply
+
+### S5
+Apply on different sites using browser_use
 
 ## How to run
 ### Prereqs:
@@ -34,22 +43,28 @@ playwright install --with-deps
 ```
 
 ## S1:
-Initializes state.json - (READY)
-(e.g., base_url) and storage_state.json (Playwright auth/cookies) for other scripts run. Need to run only once or if you need to relogin.
-
 ### Run:
 ```markdown
 python -m src.s1_prepare
 ```
 ## S2:
-Collect Links (READY). 
-Appends only new URLs to data/links.jsonl (URL-based dedupe).
-
 ### Run:
 ```markdown
 python -m src.s2_collect_links
 ```
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
+
+## S3:
+### Run:
+```markdown
+python -m s3_filter_descriptions.py
+```
+
+## S4:
+### Run:
+```markdown
+python -m src.s2_collect_links
+```
 
 ## Configuration
    
@@ -59,12 +74,15 @@ Example (with defaults)
 ```markdown
 {
   "JOB_NAMES": ["QA Automation"],
-  "LOCATIONS": ["poland-remote", "remote"],
+  "LOCATIONS": ["remote", "poland-remote"],
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
-  "FAIL_FAST": true,
-  "ALLOW_COOKIE_CLICK": false,
-  "ALLOW_LOAD_MORE_CLICK": false
+  "FAIL_FAST": false,
+  "LIMIT": 10,
+  "ALLOW_COOKIE_CLICK": true,
+  "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
+  "REQUIRE_CONFIRMATION": true,
+  "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/"
 }
 ```
 
