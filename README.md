@@ -43,25 +43,25 @@ playwright install --with-deps
 ```
 
 ## S1:
-### Run:
+Run:
 ```markdown
 python -m src.s1_prepare
 ```
 ## S2:
-### Run:
+Run:
 ```markdown
 python -m src.s2_collect_links
 ```
 Tip. While tuning selectors/behavior, set "HEADFUL": true and "ALLOW_COOKIE_CLICK": true in config.
 
 ## S3:
-### Run:
+Run:
 ```markdown
 python -m s3_filter_descriptions.py
 ```
 
 ## S4:
-### Run:
+Run:
 ```markdown
 python -m src.s2_collect_links
 ```
