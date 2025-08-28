@@ -1,8 +1,115 @@
-\data\errors
-\data\screenshots
-\data\easy_apply_log.jsonl
-\data\filtered_links.jsonl
-\data\links.jsonl
-\.mypy_cache
-\.venv
-\src\__pycache__
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+build/
+dist/
+.eggs/
+*.egg-info/
+wheels/
+share/python-wheels/
+.installed.cfg
+MANIFEST
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Testing / coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checking / lint caches
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# -------------------------
+# Editors / OS
+# -------------------------
+.vscode/
+.idea/
+*.code-workspace
+*.sw?
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -------------------------
+# Environment / secrets
+# -------------------------
+.env
+.env.*
+*.env
+*.secret
+secrets/
+credentials/
+
+# -------------------------
+# Project: Auto Job Finder
+# -------------------------
+
+# Config: keep sample, ignore real
+config/config.json
+config/*.local.json
+!config/config.sample.json
+
+# Playwright artifacts (reports, traces, videos)
+test-results/
+playwright-report/
+traces/
+.traces/
+videos/
+*.trace.zip
+*.zip
+
+# Browser/session state
+storage_state.json
+**/storage_state.json
+**/storage_state*.json
+**/*cookies*.json
+**/.auth/
+
+# Run outputs & logs
+logs/
+*.log
+
+# Errors & screenshots — ignore everything, keep optional placeholders/docs
+errors/**
+!errors/.gitkeep
+!errors/README.md
+
+screenshots/**
+!screenshots/.gitkeep
+!screenshots/README.md
+
+# -------------------------
+# Data (runtime JSON / JSONL)
+# Ignore all .json / .jsonl under data/ (incl. subfolders)
+# but keep samples/placeholders for docs.
+# -------------------------
+data/**/*.json
+data/**/*.jsonl
+data/*.json
+data/*.jsonl
+
+!data/*.sample.*
+!data/**/*.sample.*
+!data/README.md
+!data/.gitkeep
