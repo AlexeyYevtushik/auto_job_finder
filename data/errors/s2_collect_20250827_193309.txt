@@ -1,4 +1,0 @@
-TIME: 2025-08-27T17:33:09.728423+00:00
-STEP: collect_for[QA Automation|remote]
-
-TRACEBACK:
