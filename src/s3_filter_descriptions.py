@@ -311,8 +311,11 @@ async def process_one(
         }
 
         if not keyword_exists:
+            # Если ключевых слов нет — считаем обработанным, чтобы S4/S5 не трогали
+            result["processed"] = True  # ✅ ключевая правка
             append_jsonl(FILTERED_JSONL, result)
-            with suppress(Exception): await page.close()
+            with suppress(Exception): 
+                await page.close()
             return True
 
         # Try Apply flow
