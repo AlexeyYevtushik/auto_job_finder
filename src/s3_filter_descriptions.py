@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import random
 import traceback
 from contextlib import suppress
 from urllib.parse import urljoin, urlparse
@@ -486,14 +487,8 @@ async def run_with_config():
 
     headful   = bool(cfg.get("HEADFUL", True))
     fail_fast = bool(cfg.get("FAIL_FAST", False))
-    limit     = int(cfg.get("LIMIT", 0))
+    limit     = int(cfg.get("LIMIT", 0))  # процессим батчами по LIMIT; 0 = всё за один проход (как раньше)
     keywords  = normalize_keywords(cfg.get("KEYWORDS"))
-
-    # Read candidates WITHOUT consuming them
-    rows = take_new_links(limit)
-    if not rows:
-        print("[INFO] No new links with new_href=true found.")
-        return
 
     storage_state = str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None
 
@@ -508,19 +503,41 @@ async def run_with_config():
         ctx: BrowserContext = await browser.new_context(**ctx_kwargs)
         ctx.set_default_timeout(15000)
 
-        for idx, row in enumerate(rows, start=1):
-            ok = False
-            try:
-                ok = await process_one(ctx, row, keywords, headful, fail_fast)
-            except Exception:
-                # Already logged in process_one; honor FAIL_FAST by re-raising there
-                ok = False
-            if ok:
-                # Consume only successful rows
-                mark_link_consumed(row)
-            # human-like delay regardless of outcome
-            human_sleep(120, 260)
+        # NEW: батчевый цикл до полного исчерпания new_href:true
+        batch_num = 0
+        while True:
+            rows = take_new_links(limit)
+            if not rows:
+                if batch_num == 0:
+                    print("[INFO] No new links with new_href=true found.")
+                break
 
+            batch_num += 1
+            print(f"[S3] === BATCH #{batch_num}: processing {len(rows)} item(s) ===")
+
+            for idx, row in enumerate(rows, start=1):
+                ok = False
+                try:
+                    ok = await process_one(ctx, row, keywords, headful, fail_fast)
+                except Exception:
+                    ok = False
+                if ok:
+                    mark_link_consumed(row)
+                human_sleep(120, 260)
+
+            has_more = bool(take_new_links(1))
+            if has_more:
+                print("[S3] Batch done. Waiting 15–25 minutes before next batch...")
+                has_more = bool(take_new_links(1))
+            if has_more:
+                # 15–25 минут (900–1500 секунд)
+                wait_s = random.uniform(900, 1500)
+                print(f"[S3] Batch done. Waiting {int(wait_s//60)}–{int(wait_s//60)} minutes "
+                    f"({int(wait_s)} s) before next batch...")
+                await asyncio.sleep(wait_s)
+            else:
+                print("[S3] All new_href:true links are processed.")
+           
         await ctx.close()
         await browser.close()
 

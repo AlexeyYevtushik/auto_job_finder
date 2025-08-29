@@ -564,7 +564,7 @@ async def main_async():
 
             is_last = (li == len(locations)-1) and (ji == len(job_names)-1)
             if not is_last:
-                delay = random.randint(60, 240)  # 1–4 minutes
+                delay = random.randint(300, 660)  # 5–11 minutes
                 print(f"[PAUSE] Waiting {delay} seconds before next run…")
                 await asyncio.sleep(delay)
 

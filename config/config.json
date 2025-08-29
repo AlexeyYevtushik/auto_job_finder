@@ -3,12 +3,13 @@
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
   "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
   
-  
-  "LOCATIONS": ["remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "wroclaw", "lisbona", "madrid", "gdansk", "katowice", "gliwice" , "rybnik", "lodz", "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana"],
+  "LOCATIONS": ["remote", "wroclaw", "lisbona", "madrid", "gdansk", "katowice", "gliwice" , "rybnik", "lodz", "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana"], 
   "REQUIRE_CONFIRMATION": true,
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
   "FAIL_FAST": false,
-  "LIMIT": 10,
-  "ALLOW_COOKIE_CLICK": true
+  "LIMIT": 3,
+  "ALLOW_COOKIE_CLICK": true,
+  
+  "TESTED_LOCATIONS": ["remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan"]
 }
