@@ -2,11 +2,14 @@
 # Python
 # -------------------------
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+__pypackages__/
 
+# Builds / packaging
 build/
 dist/
 .eggs/
@@ -38,78 +41,6 @@ htmlcov/
 .ruff_cache/
 
 # Jupyter
-.ipynb_checkpoints/
+.ipynb_check_
 
-# -------------------------
-# Editors / OS
-# -------------------------
-.vscode/
-.idea/
-*.code-workspace
-*.sw?
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# -------------------------
-# Environment / secrets
-# -------------------------
-.env
-.env.*
-*.env
-*.secret
-secrets/
-credentials/
-
-# -------------------------
-# Project: Auto Job Finder
-# -------------------------
-
-# Config: keep sample, ignore real
-config/config.json
-config/*.local.json
-!config/config.sample.json
-
-# Playwright artifacts (reports, traces, videos)
-test-results/
-playwright-report/
-traces/
-.traces/
-videos/
-*.trace.zip
-*.zip
-
-# Browser/session state
-storage_state.json
-**/storage_state.json
-**/storage_state*.json
-**/*cookies*.json
-**/.auth/
-
-# Run outputs & logs
-logs/
-*.log
-
-# Errors & screenshots — ignore everything, keep optional placeholders/docs
-errors/**
-!errors/.gitkeep
-!errors/README.md
-
-screenshots/**
-!screenshots/.gitkeep
-!screenshots/README.md
-
-# -------------------------
-# Data (runtime JSON / JSONL)
-# Ignore all .json / .jsonl under data/ (incl. subfolders)
-# but keep samples/placeholders for docs.
-# -------------------------
-data/**/*.json
-data/**/*.jsonl
-data/*.json
-data/*.jsonl
-
-!data/*.sample.*
-!data/**/*.sample.*
-!data/README.md
-!data/.gitkeep
+data/
