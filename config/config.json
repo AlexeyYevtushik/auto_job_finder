@@ -1,10 +1,10 @@
 {
   "JOB_NAMES": ["QA Automation"],
-  "LOCATIONS": ["remote", "poland-remote"],
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
   "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
   
   
+  "LOCATIONS": ["remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "wroclaw", "lisbona", "madrid", "gdansk", "katowice", "gliwice" , "rybnik", "lodz", "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana"],
   "REQUIRE_CONFIRMATION": true,
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
