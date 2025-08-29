@@ -4,17 +4,18 @@
 # - Config: config/config.json (or env CONFIG=<path>)
 # - For each JOB_NAME × LOCATION:
 #     * Opens https://justjoin.it/job-offers/<location>?keyword=<job>
-#     * Walks li/div[@data-index] job anchors + fallback anchors containing '/job-offer/'
-#     * Human-like scroll: 2–5 short scrolls, then 1–2s pause; repeat until end
-#     * Appends NEW rows to data/links.jsonl (DEDUPE **BY URL** only)
+#     * Finds FIRST //ul/li[@data-index]//a[@href], hovers it (NO CLICKS)
+#     * LOOP until page bottom:
+#         - collect all visible anchors (URL-dedupe within run)
+#         - try scroll by 100px; if no movement -> press ArrowDown 10 times
+#     * Appends NEW rows to data/links.jsonl (global URL dedupe)
 #     * Row includes: id, data_index, job_name, location, url, new_href:true
-# - Waits 1–4 minutes between runs.
 # - TARGET_INDEXES early-stop: stop when encountering that data-index value.
-# - Robust to SPA re-renders (no element handles kept; scroll container tracked by selector).
-# - STRICT NO-CLICK mode by default (configurable).
+# - STRICT NO-CLICK mode (cookie click toggleable).
+# - If no FIRST element by //ul/li[@data-index]//a[@href] -> print "No vacancies" and skip.
 # -------------------------------------------------------------------------------
 
-import os, json, urllib.parse, random, asyncio, time, contextlib
+import os, json, urllib.parse, random, asyncio, contextlib, traceback
 from typing import List, Tuple, Set
 from pathlib import Path
 from datetime import datetime
@@ -36,9 +37,9 @@ DEFAULT_CONFIG = {
     "TARGET_INDEXES": 1000,
     "FAIL_FAST": True,
 
-    # NEW: strict no-click mode (both False by default)
+    # strict no-click toggles
     "ALLOW_COOKIE_CLICK": False,
-    "ALLOW_LOAD_MORE_CLICK": False,
+    "ALLOW_LOAD_MORE_CLICK": False,  # reserved; not used (we don't click "Show more")
 }
 
 def _guess_repo_root() -> Path:
@@ -52,20 +53,33 @@ def load_config() -> dict:
       3) <this_dir>/config.json,
       else DEFAULT_CONFIG.
     """
+    # 1) CONFIG env var
     env_path = os.environ.get("CONFIG")
     if env_path:
         p = Path(env_path)
         if p.is_file():
-            return json.loads(p.read_text(encoding="utf-8"))
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass  # fall through
 
+    # 2) repo_root/config/config.json
     repo_guess = _guess_repo_root() / "config" / "config.json"
     if repo_guess.is_file():
-        return json.loads(repo_guess.read_text(encoding="utf-8"))
+        try:
+            return json.loads(repo_guess.read_text(encoding="utf-8"))
+        except Exception:
+            pass
 
+    # 3) src/s2_collect_links.py sibling config.json
     sibling = Path(__file__).with_name("config.json")
     if sibling.is_file():
-        return json.loads(sibling.read_text(encoding="utf-8"))
+        try:
+            return json.loads(sibling.read_text(encoding="utf-8"))
+        except Exception:
+            pass
 
+    # 4) fallback
     return DEFAULT_CONFIG.copy()
 
 # ----------------------------- Helpers -----------------------------
@@ -79,9 +93,6 @@ def build_search_url(base_url: str, job: str, location: str) -> str:
     q = urllib.parse.urlencode({"keyword": job})
     return f"{base}{path}?{q}"
 
-def to_abs(current_url: str, href: str) -> str:
-    return urllib.parse.urljoin(current_url, href)
-
 def preload_seen_urls() -> Set[str]:
     """
     Collect ALL previously-saved URLs from data/links.jsonl for URL-based dedupe.
@@ -92,12 +103,6 @@ def preload_seen_urls() -> Set[str]:
         if isinstance(u, str) and u.strip():
             seen.add(u.strip())
     return seen
-
-def normalize_index_value(val: str | None) -> str | None:
-    if not val:
-        return None
-    s = str(val).strip()
-    return s if s else None
 
 async def async_handle_error(page: Page | None, prefix: str, step_info: str, fail_fast: bool):
     """Screenshot + trace writer for async flow (best effort)."""
@@ -114,13 +119,24 @@ async def async_handle_error(page: Page | None, prefix: str, step_info: str, fai
     except Exception:
         pass
 
+    tb = traceback.format_exc()
     txt.write_text(
-        f"TIME: {now_iso()}\nSTEP: {step_info}\n\nTRACEBACK:\n",
+        f"TIME: {now_iso()}\nSTEP: {step_info}\n\nTRACEBACK:\n{tb}\n",
         encoding="utf-8"
     )
     print(f"[ERROR] {prefix}: saved {png.name} and {txt.name}")
     if fail_fast:
         raise
+
+async def safe_close(context: BrowserContext | None, browser: Browser | None) -> None:
+    with contextlib.suppress(Exception):
+        if context:
+            await context.close()
+    with contextlib.suppress(Exception):
+        if browser:
+            await browser.close()
+
+TARGET_STOP_VALUE: str | None = None  # (keep this global)
 
 # ------------------------------ Playwright helpers ------------------------------
 
@@ -139,23 +155,13 @@ async def _accept_cookies_if_any(page: Page, allow_click: bool) -> None:
         ]:
             loc = page.locator(sel)
             if await loc.count() > 0:
-                # one click only if explicitly allowed
                 await loc.first.click(timeout=1000)
                 break
     except Exception:
         pass
 
-
-TARGET_STOP_VALUE: str | None = None  # (keep this global)
-
-# ---------- Scroll container discovery that survives SPA re-renders (selector only)
-
+# Find scroll container selector (if any), resilient to SPA re-renders (selector only)
 async def _locate_scroll_container_selector(page: Page) -> str | None:
-    """
-    Marks the scrollable container that holds job cards with a unique data attribute
-    and returns a CSS selector string for it. If nothing special is found, returns None
-    to signal 'use document.scrollingElement'.
-    """
     token = "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(8))
     try:
         sel = await page.evaluate("""
@@ -189,10 +195,6 @@ async def _locate_scroll_container_selector(page: Page) -> str | None:
         return None
 
 async def _focus_scroll_target(page: Page, container_sel: str | None) -> None:
-    """
-    Focuses the scroll container (or the document scroller) WITHOUT clicking.
-    Makes it keyboard-focusable by adding tabindex=-1 if needed.
-    """
     try:
         await page.evaluate(
             """
@@ -211,44 +213,6 @@ async def _focus_scroll_target(page: Page, container_sel: str | None) -> None:
         )
     except Exception:
         pass
-
-async def _scroll_by(page: Page, container_sel: str | None, step: int):
-    """Scroll either the tagged container (by selector) or the document."""
-    try:
-        await page.evaluate(
-            """
-            (sel, dy) => {
-              const el = sel ? document.querySelector(sel)
-                             : (document.scrollingElement || document.documentElement);
-              if (!el) return;
-              if (typeof el.scrollBy === 'function') el.scrollBy(0, dy);
-              else el.scrollTop = (el.scrollTop || 0) + dy;
-            }
-            """,
-            container_sel, step
-        )
-    except Exception:
-        with contextlib.suppress(Exception):
-            await page.mouse.wheel(0, step)
-
-async def _maybe_click_load_more(page: Page, allow_click: bool) -> bool:
-    """
-    Optionally click 'Load more'/'Show more'/PL variants if present.
-    Returns True if clicked. With allow_click=False, never clicks.
-    """
-    if not allow_click:
-        return False
-    labels = ["Load more", "Show more", "Pokaż więcej", "Zobacz więcej"]
-    for lab in labels:
-        try:
-            loc = page.locator(f"button:has-text('{lab}')")
-            if await loc.count() > 0 and await loc.first.is_enabled():
-                await loc.first.click(timeout=1500)
-                await asyncio.sleep(0.5)
-                return True
-        except Exception:
-            continue
-    return False
 
 async def _is_at_bottom(page: Page, container_sel: str | None) -> bool:
     try:
@@ -269,132 +233,15 @@ async def _is_at_bottom(page: Page, container_sel: str | None) -> bool:
             )
     return bool(at_doc_bottom or at_cont_bottom)
 
-async def _arrow_down_batch(page: Page, presses: int = 10) -> None:
-    # keep target focused
-    with contextlib.suppress(Exception):
-        await page.keyboard.press("Escape")  # dismiss stray focus traps softly
-    for _ in range(presses):
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("ArrowDown")
-        await asyncio.sleep(random.uniform(0.08, 0.18))
-    # settle a bit so the SPA can render newly revealed items
-    await asyncio.sleep(random.uniform(1.0, 2.0))
-
-
-async def _detect_and_close_overlays(page: Page) -> dict:
+async def _scroll_step_100(page: Page, container_sel: str | None) -> bool:
     """
-    Detect common scroll-blocking overlays and try to dismiss them softly:
-      - [role=dialog]/[role=alertdialog]
-      - position:fixed; top:0; big height (>= 40% viewport)
-      - body/html overflow hidden
-    Actions: send ESC a few times; restore overflow on html/body.
-    Returns a dict with diagnostics.
+    Try to scroll by exactly 100px. Return True if any scrollTop changed.
     """
-    diag = {"found": False, "restored_overflow": False, "esc_sent": 0}
-
-    # Send a few ESC presses (soft close)
-    for _ in range(3):
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("Escape")
-            diag["esc_sent"] += 1
-        await asyncio.sleep(0.15)
-
     try:
-        res = await page.evaluate("""
-        () => {
-          const html = document.documentElement;
-          const body = document.body;
-
-          const getVis = el => {
-            const cs = getComputedStyle(el);
-            return !(cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0);
-          };
-
-          const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(getVis);
-
-          const fixedTop = Array.from(document.querySelectorAll('body *')).filter(el => {
-            const cs = getComputedStyle(el);
-            if (!getVis(el)) return false;
-            if (cs.position !== 'fixed') return false;
-            const top = parseInt(cs.top || '0', 10);
-            const h = el.getBoundingClientRect().height;
-            return (top === 0) && (h >= window.innerHeight * 0.4);
-          });
-
-          const htmlHidden = getComputedStyle(html).overflowY === 'hidden' || getComputedStyle(html).overflow === 'hidden';
-          const bodyHidden = getComputedStyle(body).overflowY === 'hidden' || getComputedStyle(body).overflow === 'hidden';
-
-          // Try to restore overflow if hidden
-          let restored = false;
-          if (htmlHidden) { html.style.overflowY = 'auto'; html.style.overflow = 'auto'; restored = true; }
-          if (bodyHidden) { body.style.overflowY = 'auto'; body.style.overflow = 'auto'; restored = true; }
-
-          return {
-            dialogs: dialogs.length,
-            fixedTop: fixedTop.length,
-            restored
-          };
-        }
-        """)
-        diag["found"] = (res.get("dialogs", 0) > 0) or (res.get("fixedTop", 0) > 0)
-        diag["restored_overflow"] = bool(res.get("restored"))
-    except Exception:
-        pass
-
-    # A couple more ESC presses after style restore
-    if diag["found"]:
-        for _ in range(2):
-            with contextlib.suppress(Exception):
-                await page.keyboard.press("Escape")
-                diag["esc_sent"] += 1
-            await asyncio.sleep(0.15)
-
-    return diag
-
-
-async def _arrow_down_to_bottom(page: Page, container_sel: str | None, max_presses: int = 1000) -> bool:
-    """
-    Fallback: press ArrowDown repeatedly (with 1–2s pauses) until bottom or cap.
-    Occasionally send End to nudge. Returns True if bottom reached.
-    """
-    # make sure the scroll target has focus
-    await _focus_scroll_target(page, container_sel)
-
-    for i in range(max_presses):
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.7, 1.0))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.keyboard.press("ArrowDown")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-        await asyncio.sleep(random.uniform(2.0, 3.0))
-
-        if await _is_at_bottom(page, container_sel):
-            return True
-    return await _is_at_bottom(page, container_sel)
-
-async def _scroll_step(page: Page, container_sel: str | None, dy: int = 100) -> bool:
-    try:
-        moved = await page.evaluate(
+        return await page.evaluate(
             """
-            (sel, dy) => {
-              const getDocEl = () => document.scrollingElement || document.documentElement;
-              const tryEl = (el) => {
+            (sel) => {
+              const tryEl = (el, dy=100) => {
                 if (!el) return false;
                 const before = el.scrollTop || 0;
                 if (typeof el.scrollBy === 'function') el.scrollBy(0, dy);
@@ -402,240 +249,216 @@ async def _scroll_step(page: Page, container_sel: str | None, dy: int = 100) -> 
                 return (el.scrollTop || 0) !== before;
               };
 
-              // container
+              // 1) dedicated container
               if (sel) {
                 const el = document.querySelector(sel);
                 if (tryEl(el)) return true;
               }
 
-              // window/document
-              const docEl = getDocEl();
-              const beforeWin = (window.scrollY || docEl.scrollTop || 0);
-              window.scrollBy(0, dy);
-              const afterWin = (window.scrollY || docEl.scrollTop || 0);
+              // 2) window/document
+              const de = document.scrollingElement || document.documentElement;
+              const beforeWin = (window.scrollY || de.scrollTop || 0);
+              window.scrollBy(0, 100);
+              const afterWin = (window.scrollY || de.scrollTop || 0);
               if (afterWin !== beforeWin) return true;
 
-              // ancestors of first card
-              const first = document.querySelector("ul li[data-index] a[href*='/job-offer/'], [data-index] a[href*='/job-offer/'], a[href*='/job-offer/']");
+              // 3) nearest scrollable ancestor of first card (safety)
+              const first =
+                document.querySelector("ul li[data-index] a[href*='/job-offer/']") ||
+                document.querySelector("[data-index] a[href*='/job-offer/']") ||
+                document.querySelector("a[href*='/job-offer/']");
               let cur = first ? first.parentElement : null;
               let hops = 0;
               while (cur && hops < 8) {
                 const cs = getComputedStyle(cur);
                 if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && cur.scrollHeight > cur.clientHeight + 8) {
                   const b = cur.scrollTop || 0;
-                  cur.scrollTop = b + dy;
+                  cur.scrollTop = b + 100;
                   if ((cur.scrollTop || 0) !== b) return true;
                 }
                 cur = cur.parentElement;
                 hops++;
               }
 
-              // tallest scrollable element
-              let best = null, maxH = 0;
-              for (const el of Array.from(document.querySelectorAll('body *'))) {
-                const cs = getComputedStyle(el);
-                if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 8) {
-                  if (el.scrollHeight > maxH) { maxH = el.scrollHeight; best = el; }
-                }
-              }
-              if (best) {
-                const b = best.scrollTop || 0;
-                best.scrollTop = b + dy;
-                if ((best.scrollTop || 0) !== b) return true;
-              }
-
               return false;
             }
             """,
-            container_sel, dy
+            container_sel
         )
-        if moved:
-            return True
-
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("PageDown")
-            return True
-
-        return False
     except Exception:
         return False
 
-# ------------------------------ Core collector --------------------------------
+async def _press_arrow_down_10(page: Page) -> None:
+    with contextlib.suppress(Exception):
+        await page.keyboard.press("Escape")  # dismiss focus traps
+    for _ in range(10):
+        with contextlib.suppress(Exception):
+            await page.keyboard.press("ArrowDown")
+        await asyncio.sleep(random.uniform(0.06, 0.12))
 
-async def human_simple_scroll(page: Page, container_sel: str | None) -> None:
+async def _detect_and_close_overlays(page: Page) -> None:
     """
-    Step 100px -> wait 1–2s -> until bottom.
-    If scroll doesn't move 5x in a row: try to detect/close overlays (ESC + restore overflow).
-    If scroll doesn't move 10x in a row: fallback to ArrowDown until bottom.
+    Soft overlay mitigation: ESC a couple times + restore overflow on html/body.
     """
-    no_move_streak = 0
+    for _ in range(2):
+        with contextlib.suppress(Exception):
+            await page.keyboard.press("Escape")
+        await asyncio.sleep(0.12)
+
+    with contextlib.suppress(Exception):
+        await page.evaluate("""
+        () => {
+          const html = document.documentElement;
+          const body = document.body;
+          const htmlHidden = getComputedStyle(html).overflowY === 'hidden' || getComputedStyle(html).overflow === 'hidden';
+          const bodyHidden = getComputedStyle(body).overflowY === 'hidden' || getComputedStyle(body).overflow === 'hidden';
+          if (htmlHidden) { html.style.overflowY = 'auto'; html.style.overflow = 'auto'; }
+          if (bodyHidden) { body.style.overflowY = 'auto'; body.style.overflow = 'auto'; }
+        }
+        """)
+
+# ------------------------------ Core: hover + incremental collect + scroll ------------------------------
+
+XPATH_STRICT_FIRST = "xpath=//ul/li[@data-index]//a[@href]"
+XPATH_ANCHORS_UNION = (
+    "xpath=("
+    "//ul/li[@data-index]//a[@href] | "
+    "//*[(self::li or self::div) and @data-index]//a[@href] | "
+    "//a[contains(@href, '/job-offer/')]"
+    ")"
+)
+XPATH_IDX_PARENT = "xpath=ancestor::*[(self::li or self::div) and @data-index][1]"
+
+async def _hover_first_required(page: Page) -> bool:
+    """
+    Find FIRST //ul/li[@data-index]//a[@href], hover it, NO CLICK.
+    """
+    loc = page.locator(XPATH_STRICT_FIRST)
+    try:
+        await loc.first.wait_for(timeout=4000)
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await loc.first.hover(timeout=1500)
+    return True
+
+async def _collect_visible_anchors(page: Page, seen_local: Set[str], results: List[Tuple[str, str]]) -> Tuple[bool, int]:
+    """
+    Sweep current DOM and append NEW (data_index, abs_url) into results, local dedupe by URL.
+    Returns (hit_target_stop, added_count)
+    """
+    added = 0
+    anchors = page.locator(XPATH_ANCHORS_UNION)
+    try:
+        count = await anchors.count()
+    except Exception:
+        count = 0
+
+    for i in range(count):
+        try:
+            a = anchors.nth(i)
+
+            idx_parent = a.locator(XPATH_IDX_PARENT).first
+            di = None
+            try:
+                if await idx_parent.count() > 0:
+                    raw = await idx_parent.get_attribute("data-index")
+                    di = raw.strip() if raw else None
+            except Exception:
+                di = None
+
+            href = (await a.get_attribute("href")) or ""
+            if not href:
+                continue
+            abs_url = urllib.parse.urljoin(page.url, href)
+
+            if abs_url in seen_local:
+                continue
+
+            di_eff = di or f"u{len(results)+1}"
+            results.append((di_eff, abs_url))
+            seen_local.add(abs_url)
+            added += 1
+
+            if TARGET_STOP_VALUE and di and di == str(TARGET_STOP_VALUE):
+                return True, added
+        except Exception:
+            continue
+    return False, added
+
+async def collect_incremental(page: Page) -> list[tuple[str, str]]:
+    """
+    Incremental collector:
+      - ensure first required anchor exists + hover
+      - find/focus scroll container
+      - loop:
+          * collect visible anchors
+          * if bottom -> break
+          * try scroll by 100px; if no movement -> ArrowDown x10
+          * overlay mitigation occasionally
+      - return all collected pairs
+    """
+    # Wait initial load
+    with contextlib.suppress(Exception):
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    with contextlib.suppress(Exception):
+        await page.wait_for_load_state("networkidle", timeout=15000)
+
+    # FIRST anchor + hover
+    if not await _hover_first_required(page):
+        print("[INFO] No vacancies detected on this page (no FIRST //ul/li[@data-index]//a[@href]).")
+        return []
+
+    # Locate scroll target and focus
+    container_sel = await _locate_scroll_container_selector(page)
+    await _focus_scroll_target(page, container_sel)
+
+    results: List[Tuple[str, str]] = []
+    seen_local: Set[str] = set()
+    stalls = 0
+    sweeps_without_add = 0
+
     while True:
-        moved = await _scroll_step(page, container_sel, dy=100)
-        if not moved:
-            no_move_streak += 1
-        else:
-            no_move_streak = 0
-
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        # 1) collect visible anchors
+        hit_stop, added = await _collect_visible_anchors(page, seen_local, results)
+        if hit_stop:
+            break
 
         # bottom?
         if await _is_at_bottom(page, container_sel):
             break
 
-        # 5 attempts w/o movement => try overlay mitigation
-        if no_move_streak == 5:
-            diag = await _detect_and_close_overlays(page)
-            print(f"[INFO] Overlay mitigation: found={diag['found']} restored_overflow={diag['restored_overflow']} esc_sent={diag['esc_sent']}")
-            # refocus scroll target after overlays
+        if added == 0:
+            sweeps_without_add += 1
+        else:
+            sweeps_without_add = 0
+
+        # 2) try scroll by 100px
+        moved = await _scroll_step_100(page, container_sel)
+        if not moved:
+            stalls += 1
+            await _press_arrow_down_10(page)
+        else:
+            stalls = 0
+
+        # mitigate & refocus occasionally
+        if stalls in (2, 4) or sweeps_without_add in (2, 4):
+            await _detect_and_close_overlays(page)
             await _focus_scroll_target(page, container_sel)
 
-        # 10 attempts w/o movement => switch to ArrowDown fallback
-        if no_move_streak >= 10:
-            print("[WARN] Scroll didn't move for 10 attempts; switching to ArrowDown fallback...")
-            reached = await _arrow_down_to_bottom(page, container_sel, max_presses=400)
-            if reached:
-                break
-            else:
-                # even fallback failed — stop to avoid infinite loop
-                print("[ERROR] ArrowDown fallback did not reach bottom; stopping.")
-                break
+        # small human-like pause
+        await asyncio.sleep(random.uniform(0.06, 0.16))
 
+        # loop continues until bottom reached
 
-async def get_urls_and_indexes(
-    page: Page,
-    allow_click_load_more: bool  # kept for signature compatibility, unused
-) -> list[tuple[str, str]]:  # (data_index, absolute_url)
-    XPATH_ANCHORS = (
-        "xpath=("
-        "//ul/li[@data-index]//a[@href] | "
-        "//*[(self::li or self::div) and @data-index]//a[@href] | "
-        "//a[contains(@href, '/job-offer/')]"
-        ")"
-    )
-    XPATH_IDX_PARENT = "xpath=ancestor::*[(self::li or self::div) and @data-index][1]"
-
-    results: List[Tuple[str, str]] = []
-    seen_local_urls: Set[str] = set()
-
-    # 1) Wait content
-    with contextlib.suppress(Exception):
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
-    with contextlib.suppress(Exception):
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    await page.wait_for_selector(XPATH_ANCHORS, timeout=20000)
-
-    # 2) Find/focus scroller (NO CLICK)
-    container_sel = await _locate_scroll_container_selector(page)
-    await _focus_scroll_target(page, container_sel)
-
-    # 3) Hover first card (NO CLICK)
-    anchors = page.locator(XPATH_ANCHORS)
-    if await anchors.count() > 0:
-        with contextlib.suppress(Exception):
-            await anchors.first.hover(timeout=1500)
-
-    # helper: sweep current DOM and append NEW urls (local dedupe)
-    async def sweep_and_collect() -> tuple[bool, int]:
-        added = 0
-        try:
-            count = await anchors.count()
-        except Exception:
-            count = 0
-
-        for i in range(count):
-            try:
-                a = anchors.nth(i)
-
-                idx_parent = a.locator(XPATH_IDX_PARENT).first
-                di = None
-                try:
-                    if await idx_parent.count() > 0:
-                        raw = await idx_parent.get_attribute("data-index")
-                        di = raw.strip() if raw else None
-                except Exception:
-                    di = None
-
-                href = (await a.get_attribute("href")) or ""
-                if not href:
-                    continue
-                abs_url = urllib.parse.urljoin(page.url, href)
-
-                if abs_url in seen_local_urls:
-                    continue
-
-                di_eff = di or f"u{len(results)+1}"
-                results.append((di_eff, abs_url))
-                seen_local_urls.add(abs_url)
-                added += 1
-
-                if TARGET_STOP_VALUE and di and di == str(TARGET_STOP_VALUE):
-                    return True, added
-            except Exception:
-                continue
-        return False, added
-
-    # initial sweep (collect what’s visible at the top)
-    early, _ = await sweep_and_collect()
-    if early:
-        return results
-
-    # 4) MAIN LOOP: 10 ArrowDown presses -> collect -> repeat
-    no_progress = 0
-    prev_seen_total = await anchors.count()
-    while True:
-        # ensure focus on the target (SPA may swap containers)
-        await _focus_scroll_target(page, container_sel)
-
-        # batch: 10 ArrowDown presses with small delays
-        await _arrow_down_batch(page, presses=10)
-
-        # collect newly revealed items
-        early, added = await sweep_and_collect()
-        if early:
-            return results
-
-        # stop if bottom reached
-        if await _is_at_bottom(page, container_sel):
-            break
-
-        # progress detection
-        with contextlib.suppress(Exception):
-            cur_total = await anchors.count()
-        progressed = (cur_total > prev_seen_total) or (added > 0)
-        prev_seen_total = cur_total
-
-        if progressed:
-            no_progress = 0
-        else:
-            no_progress += 1
-            # overlay mitigation after two "no progress" batches
-            if no_progress == 2:
-                diag = await _detect_and_close_overlays(page)
-                print(f"[INFO] Overlay mitigation: found={diag['found']} restored_overflow={diag['restored_overflow']} esc_sent={diag['esc_sent']}")
-                await _focus_scroll_target(page, container_sel)
-            # gentle nudge with End every 3rd stall
-            if no_progress % 3 == 0:
-                with contextlib.suppress(Exception):
-                    await page.keyboard.press("End")
-                await asyncio.sleep(0.4)
-            # safety: break after too many stalls to avoid infinite loops
-            if no_progress >= 8:
-                print("[WARN] No scroll progress for 8 batches — stopping to avoid hang.")
-                break
-
-    # final sweep
-    await sweep_and_collect()
+    # final sweep (grab anything newly visible at the very bottom)
+    await _collect_visible_anchors(page, seen_local, results)
     return results
 
 # ------------------------------ Saver / Dedupe -------------------------------
 
 def save_if_new_href(data_index: str, url: str, seen_urls: Set[str],
                      job_name: str, location: str) -> bool:
-    """
-    Append to data/links.jsonl IFF URL is NEW (URL-based dedupe).
-    Row shape:
-      {"id":"jj-<data-index>", "data_index":"<data-index>", "job_name":..., "location":..., "url":"<url>", "new_href": true}
-    """
     if not url:
         return False
     u = url.strip()
@@ -660,7 +483,7 @@ def save_if_new_href(data_index: str, url: str, seen_urls: Set[str],
 
 async def collect_for(job_name: str, location: str, headful: bool, fail_fast: bool,
                       allow_cookie_click: bool, allow_load_more_click: bool) -> None:
-    page = None
+    page: Page | None = None
     browser: Browser | None = None
     context: BrowserContext | None = None
     try:
@@ -685,30 +508,27 @@ async def collect_for(job_name: str, location: str, headful: bool, fail_fast: bo
             # cookies (click only if allowed)
             await _accept_cookies_if_any(page, allow_cookie_click)
 
-            seen_urls = preload_seen_urls()
-            pairs = await get_urls_and_indexes(page, allow_click_load_more=allow_load_more_click)
+            # incremental collect (hover -> collect/scroll loop)
+            pairs = await collect_incremental(page)
 
-            added = 0
-            for data_index, url in pairs:
-                if save_if_new_href(data_index, url, seen_urls, job_name, location):
-                    added += 1
+            # save with global URL-dedupe
+            seen_urls = preload_seen_urls()
+            if not pairs:
+                print(f"[INFO] No collectable anchors for job='{job_name}', location='{location}'.")
+            else:
+                added = 0
+                for data_index, url in pairs:
+                    if save_if_new_href(data_index, url, seen_urls, job_name, location):
+                        added += 1
+                print(f"[OK] Added {added} NEW hrefs to {LINKS_JSONL}. Total known hrefs: {len(seen_urls)}")
 
             with contextlib.suppress(Exception):
                 await context.storage_state(path=str(STORAGE_STATE_JSON))
 
-            print(f"[OK] Added {added} NEW hrefs to {LINKS_JSONL}. Total known hrefs: {len(seen_urls)}")
-
-            await context.close()
-            await browser.close()
-
     except Exception:
         await async_handle_error(page, "s2_collect", f"collect_for[{job_name}|{location}]", fail_fast)
-        try:
-            if context:
-                await context.close()
-        finally:
-            if browser:
-                await browser.close()
+    finally:
+        await safe_close(context, browser)
 
 # -------------------------------------- Main ----------------------------------------
 
