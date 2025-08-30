@@ -1,34 +1,34 @@
-# src/s2_collect_links.py
-# -------------------------------------------------------------------------------
-# CONFIG-DRIVEN LINK COLLECTOR (S2) — ASYNC VERSION
-# - Config: config/config.json (or env CONFIG=<path>)
-# - For each JOB_NAME × LOCATION:
-#     * Opens https://justjoin.it/job-offers/<location>?keyword=<job>
-#     * Finds FIRST //ul/li[@data-index]//a[@href], hovers it (NO CLICKS)
-#     * LOOP until page bottom:
-#         - collect all visible anchors (URL-dedupe within run)
-#         - try scroll by 100px; if no movement -> press ArrowDown 10 times
-#     * Appends NEW rows to data/links.jsonl (global URL dedupe)
-#     * Row includes: id, data_index, job_name, location, url, new_href:true
-# - TARGET_INDEXES early-stop: stop when encountering that data-index value.
-# - STRICT NO-CLICK mode (cookie click toggleable).
-# - If no FIRST element by //ul/li[@data-index]//a[@href] -> print "No vacancies" and skip.
-# -------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# s2_collect_links.py — Async JustJoin.it link collector
+#
+# - Loads config (default + config/config.json).
+# - Builds search URL for each JOB_NAME × LOCATION.
+# - Opens search page with Playwright Chromium (headful/headless).
+# - Hovers first job card anchor to activate list.
+# - Scrolls down 100px steps; if stuck, presses ArrowDown.
+# - After each scroll, scans anchors //ul/li[@data-index]//a[@href].
+# - Deduplicates globally (data/links.jsonl) and locally in run.
+# - Saves new rows: {id, data_index, job_name, location, url, new_href:true}.
+# - Stops when LIMIT reached, bottom reached, or timeout.
+# - After each run waits: 11–21 min if limit hit, else 5–11 min.
+# - Saves screenshots + error trace if exceptions (errors/, screenshots/).
+# - Updates storage_state.json for session persistence.
+# - Safe close of context/browser always.
+# - Idempotent: does not duplicate existing URLs.
+# - Run via: python -m src.s2_collect_links
+# ----------------------------------------------------------------------------- 
 
-import os, json, urllib.parse, random, asyncio, contextlib, traceback
-from typing import List, Tuple, Set
+
+import os, json, urllib.parse, random, asyncio, contextlib, traceback, time
+from typing import List, Tuple, Set, Optional
 from pathlib import Path
 from datetime import datetime
-
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-
 from .common import (
     read_jsonl, append_jsonl, load_json,
     LINKS_JSONL, STATE_JSON, now_iso,
     ERRORS_DIR, SCREENSHOTS_DIR, STORAGE_STATE_JSON
 )
-
-# ----------------------------- Config handling -----------------------------
 
 DEFAULT_CONFIG = {
     "JOB_NAMES": ["QA Automation"],
@@ -36,537 +36,215 @@ DEFAULT_CONFIG = {
     "HEADFUL": True,
     "TARGET_INDEXES": 1000,
     "FAIL_FAST": True,
-
-    # strict no-click toggles
     "ALLOW_COOKIE_CLICK": False,
-    "ALLOW_LOAD_MORE_CLICK": False,  # reserved; not used (we don't click "Show more")
+    "MAX_LOOP_SECONDS": 180,
+    "SLEEP_MIN": 0.06,
+    "SLEEP_MAX": 0.16,
+    "LIMIT": 2
 }
+
+def log(msg: str, **kv):
+    ts = datetime.now().strftime("%H:%M:%S")
+    extras = " ".join(f"{k}={v}" for k,v in kv.items())
+    print(f"[INFO] {ts} {msg} {extras}".strip())
 
 def _guess_repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 def load_config() -> dict:
-    """
-    Load JSON config from:
-      1) env CONFIG (path to JSON),
-      2) <repo_root>/config/config.json,
-      3) <this_dir>/config.json,
-      else DEFAULT_CONFIG.
-    """
-    # 1) CONFIG env var
     env_path = os.environ.get("CONFIG")
-    if env_path:
-        p = Path(env_path)
-        if p.is_file():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                pass  # fall through
-
-    # 2) repo_root/config/config.json
+    if env_path and Path(env_path).is_file():
+        return {**DEFAULT_CONFIG, **json.loads(Path(env_path).read_text("utf-8"))}
     repo_guess = _guess_repo_root() / "config" / "config.json"
     if repo_guess.is_file():
-        try:
-            return json.loads(repo_guess.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    # 3) src/s2_collect_links.py sibling config.json
-    sibling = Path(__file__).with_name("config.json")
-    if sibling.is_file():
-        try:
-            return json.loads(sibling.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    # 4) fallback
+        return {**DEFAULT_CONFIG, **json.loads(repo_guess.read_text("utf-8"))}
     return DEFAULT_CONFIG.copy()
 
-# ----------------------------- Helpers -----------------------------
-
 def build_search_url(base_url: str, job: str, location: str) -> str:
-    """
-    https://justjoin.it/job-offers/<location>?keyword=<job>
-    """
     base = base_url.rstrip("/")
     path = f"/job-offers/{location.strip('/')}"
     q = urllib.parse.urlencode({"keyword": job})
     return f"{base}{path}?{q}"
 
 def preload_seen_urls() -> Set[str]:
-    """
-    Collect ALL previously-saved URLs from data/links.jsonl for URL-based dedupe.
-    """
     seen: Set[str] = set()
     for row in read_jsonl(LINKS_JSONL):
         u = row.get("url")
-        if isinstance(u, str) and u.strip():
+        if isinstance(u,str) and u.strip():
             seen.add(u.strip())
     return seen
 
-async def async_handle_error(page: Page | None, prefix: str, step_info: str, fail_fast: bool):
-    """Screenshot + trace writer for async flow (best effort)."""
+async def async_handle_error(page: Optional[Page], prefix: str, step_info: str, fail_fast: bool):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
     png = SCREENSHOTS_DIR / f"{prefix}_{ts}.png"
     txt = ERRORS_DIR / f"{prefix}_{ts}.txt"
-
     try:
-        if page:
-            await page.screenshot(path=str(png), full_page=True)
-    except Exception:
-        pass
-
+        if page: await page.screenshot(path=str(png), full_page=True)
+    except: pass
     tb = traceback.format_exc()
-    txt.write_text(
-        f"TIME: {now_iso()}\nSTEP: {step_info}\n\nTRACEBACK:\n{tb}\n",
-        encoding="utf-8"
-    )
-    print(f"[ERROR] {prefix}: saved {png.name} and {txt.name}")
-    if fail_fast:
-        raise
+    txt.write_text(f"{now_iso()}\nSTEP:{step_info}\n{tb}\n","utf-8")
+    print(f"[ERROR] {prefix} saved {png.name} {txt.name}")
+    if fail_fast: raise
 
-async def safe_close(context: BrowserContext | None, browser: Browser | None) -> None:
+async def safe_close(context: Optional[BrowserContext], browser: Optional[Browser]):
     with contextlib.suppress(Exception):
-        if context:
-            await context.close()
+        if context: await context.close()
     with contextlib.suppress(Exception):
-        if browser:
-            await browser.close()
+        if browser: await browser.close()
 
-TARGET_STOP_VALUE: str | None = None  # (keep this global)
+TARGET_STOP_VALUE: Optional[str] = None
+XPATH_STRICT = "xpath=//ul/li[@data-index]//a[@href]"
 
-# ------------------------------ Playwright helpers ------------------------------
-
-async def _accept_cookies_if_any(page: Page, allow_click: bool) -> None:
-    """
-    Best-effort cookie handling. If clicking is not allowed, do nothing.
-    """
-    if not allow_click:
-        return
+async def _hover_first(page: Page) -> bool:
     try:
-        for sel in [
-            "button:has-text('Accept')",
-            "button:has-text('I agree')",
-            "button:has-text('Akceptuj')",
-            "button:has-text('Zgadzam')",
-        ]:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                await loc.first.click(timeout=1000)
-                break
-    except Exception:
-        pass
-
-# Find scroll container selector (if any), resilient to SPA re-renders (selector only)
-async def _locate_scroll_container_selector(page: Page) -> str | None:
-    token = "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(8))
-    try:
-        sel = await page.evaluate("""
-        (tok) => {
-          const first =
-            document.querySelector("ul li[data-index] a[href*='/job-offer/']") ||
-            document.querySelector("[data-index] a[href*='/job-offer/']") ||
-            document.querySelector("a[href*='/job-offer/']");
-          const findScrollable = (start) => {
-            let el = start;
-            while (el) {
-              const cs = getComputedStyle(el);
-              const ovy = cs.overflowY;
-              if ((ovy === 'auto' || ovy === 'scroll') && el.scrollHeight > el.clientHeight + 8) {
-                return el;
-              }
-              el = el.parentElement;
-            }
-            return null;
-          };
-          const sc = findScrollable(first || document.body);
-          if (sc && sc !== document.body && sc !== document.documentElement) {
-            sc.setAttribute("data-jjf-scroll", tok);
-            return `[data-jjf-scroll="${tok}"]`;
-          }
-          return null;
-        }
-        """, token)
-        return sel
-    except Exception:
-        return None
-
-async def _focus_scroll_target(page: Page, container_sel: str | None) -> None:
-    try:
-        await page.evaluate(
-            """
-            (sel) => {
-              const el = sel ? document.querySelector(sel)
-                             : (document.scrollingElement || document.documentElement);
-              if (!el) return false;
-              if (el !== document.body && el !== document.documentElement && !el.hasAttribute('tabindex')) {
-                el.setAttribute('tabindex','-1');
-              }
-              try { el.focus({ preventScroll: true }); } catch(e) { el.focus(); }
-              return true;
-            }
-            """,
-            container_sel
-        )
-    except Exception:
-        pass
-
-async def _is_at_bottom(page: Page, container_sel: str | None) -> bool:
-    try:
-        at_doc_bottom = await page.evaluate(
-            "() => { const el = document.scrollingElement || document.documentElement; "
-            "return Math.ceil(el.scrollTop + window.innerHeight) >= el.scrollHeight - 2; }"
-        )
-    except Exception:
-        at_doc_bottom = False
-
-    at_cont_bottom = False
-    if container_sel:
-        with contextlib.suppress(Exception):
-            at_cont_bottom = await page.evaluate(
-                "(sel) => { const el = document.querySelector(sel); if (!el) return false; "
-                "return Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight - 2; }",
-                container_sel
-            )
-    return bool(at_doc_bottom or at_cont_bottom)
-
-async def _scroll_step_100(page: Page, container_sel: str | None) -> bool:
-    """
-    Try to scroll by exactly 100px. Return True if any scrollTop changed.
-    """
-    try:
-        return await page.evaluate(
-            """
-            (sel) => {
-              const tryEl = (el, dy=100) => {
-                if (!el) return false;
-                const before = el.scrollTop || 0;
-                if (typeof el.scrollBy === 'function') el.scrollBy(0, dy);
-                else el.scrollTop = before + dy;
-                return (el.scrollTop || 0) !== before;
-              };
-
-              // 1) dedicated container
-              if (sel) {
-                const el = document.querySelector(sel);
-                if (tryEl(el)) return true;
-              }
-
-              // 2) window/document
-              const de = document.scrollingElement || document.documentElement;
-              const beforeWin = (window.scrollY || de.scrollTop || 0);
-              window.scrollBy(0, 100);
-              const afterWin = (window.scrollY || de.scrollTop || 0);
-              if (afterWin !== beforeWin) return true;
-
-              // 3) nearest scrollable ancestor of first card (safety)
-              const first =
-                document.querySelector("ul li[data-index] a[href*='/job-offer/']") ||
-                document.querySelector("[data-index] a[href*='/job-offer/']") ||
-                document.querySelector("a[href*='/job-offer/']");
-              let cur = first ? first.parentElement : null;
-              let hops = 0;
-              while (cur && hops < 8) {
-                const cs = getComputedStyle(cur);
-                if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && cur.scrollHeight > cur.clientHeight + 8) {
-                  const b = cur.scrollTop || 0;
-                  cur.scrollTop = b + 100;
-                  if ((cur.scrollTop || 0) !== b) return true;
-                }
-                cur = cur.parentElement;
-                hops++;
-              }
-
-              return false;
-            }
-            """,
-            container_sel
-        )
-    except Exception:
-        return False
-
-async def _press_arrow_down_10(page: Page) -> None:
-    with contextlib.suppress(Exception):
-        await page.keyboard.press("Escape")  # dismiss focus traps
-    for _ in range(10):
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("ArrowDown")
-        await asyncio.sleep(random.uniform(0.06, 0.12))
-
-async def _detect_and_close_overlays(page: Page) -> None:
-    """
-    Soft overlay mitigation: ESC a couple times + restore overflow on html/body.
-    """
-    for _ in range(2):
-        with contextlib.suppress(Exception):
-            await page.keyboard.press("Escape")
-        await asyncio.sleep(0.12)
-
-    with contextlib.suppress(Exception):
-        await page.evaluate("""
-        () => {
-          const html = document.documentElement;
-          const body = document.body;
-          const htmlHidden = getComputedStyle(html).overflowY === 'hidden' || getComputedStyle(html).overflow === 'hidden';
-          const bodyHidden = getComputedStyle(body).overflowY === 'hidden' || getComputedStyle(body).overflow === 'hidden';
-          if (htmlHidden) { html.style.overflowY = 'auto'; html.style.overflow = 'auto'; }
-          if (bodyHidden) { body.style.overflowY = 'auto'; body.style.overflow = 'auto'; }
-        }
-        """)
-
-# ------------------------------ Core: hover + incremental collect + scroll ------------------------------
-
-XPATH_STRICT_FIRST = "xpath=//ul/li[@data-index]//a[@href]"
-XPATH_ANCHORS_UNION = (
-    "xpath=("
-    "//ul/li[@data-index]//a[@href] | "
-    "//*[(self::li or self::div) and @data-index]//a[@href] | "
-    "//a[contains(@href, '/job-offer/')]"
-    ")"
-)
-XPATH_IDX_PARENT = "xpath=ancestor::*[(self::li or self::div) and @data-index][1]"
-
-async def _hover_first_required(page: Page) -> bool:
-    """
-    Find FIRST //ul/li[@data-index]//a[@href], hover it, NO CLICK.
-    """
-    loc = page.locator(XPATH_STRICT_FIRST)
-    try:
+        loc = page.locator(XPATH_STRICT)
         await loc.first.wait_for(timeout=4000)
-    except Exception:
-        return False
-    with contextlib.suppress(Exception):
         await loc.first.hover(timeout=1500)
+        return True
+    except:
+        return False
+
+async def _is_at_bottom(page: Page) -> bool:
+    js = "() => {const el=document.scrollingElement||document.documentElement;return Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight-2;}"
+    try:
+        return await page.evaluate(js)
+    except:
+        return False
+
+async def _scroll_step(page: Page) -> bool:
+    js = "() => {const el=document.scrollingElement||document.documentElement;let b=el.scrollTop;window.scrollBy(0,100);return (el.scrollTop-b)>0;}"
+    try:
+        return await page.evaluate(js)
+    except:
+        return False
+
+async def _press_down(page: Page):
+    with contextlib.suppress(Exception): await page.keyboard.press("Escape")
+    for _ in range(10):
+        with contextlib.suppress(Exception): await page.keyboard.press("ArrowDown")
+        await asyncio.sleep(0.05)
+
+def _save_new_if_needed(di: str, url: str, seen_global: Set[str], job: str, loc: str) -> bool:
+    if not url or url in seen_global:
+        return False
+    append_jsonl(LINKS_JSONL, {
+        "id": f"jj-{di}",
+        "data_index": str(di),
+        "job_name": job,
+        "location": loc,
+        "url": url,
+        "new_href": True
+    })
+    seen_global.add(url)
+    log("Collected new", url=url)
     return True
 
-async def _collect_visible_anchors(page: Page, seen_local: Set[str], results: List[Tuple[str, str]]) -> Tuple[bool, int]:
-    """
-    Sweep current DOM and append NEW (data_index, abs_url) into results, local dedupe by URL.
-    Returns (hit_target_stop, added_count)
-    """
-    added = 0
-    anchors = page.locator(XPATH_ANCHORS_UNION)
+async def _scan_and_save(page: Page, seen_global: Set[str], job: str, loc: str, results_in_run: List[Tuple[str,str]]) -> int:
+    added_count = 0
     try:
-        count = await anchors.count()
-    except Exception:
-        count = 0
-
-    for i in range(count):
+        handles = await page.locator(XPATH_STRICT).element_handles()
+    except:
+        return 0
+    for h in handles:
         try:
-            a = anchors.nth(i)
-
-            idx_parent = a.locator(XPATH_IDX_PARENT).first
-            di = None
-            try:
-                if await idx_parent.count() > 0:
-                    raw = await idx_parent.get_attribute("data-index")
-                    di = raw.strip() if raw else None
-            except Exception:
-                di = None
-
-            href = (await a.get_attribute("href")) or ""
+            href = await h.get_attribute("href")
             if not href:
                 continue
             abs_url = urllib.parse.urljoin(page.url, href)
-
-            if abs_url in seen_local:
+            if any(abs_url == u for _, u in results_in_run):
                 continue
-
-            di_eff = di or f"u{len(results)+1}"
-            results.append((di_eff, abs_url))
-            seen_local.add(abs_url)
-            added += 1
-
-            if TARGET_STOP_VALUE and di and di == str(TARGET_STOP_VALUE):
-                return True, added
-        except Exception:
+            di = "u" + str(len(results_in_run) + 1)
+            if _save_new_if_needed(di, abs_url, seen_global, job, loc):
+                results_in_run.append((di, abs_url))
+                added_count += 1
+                if TARGET_STOP_VALUE and di == str(TARGET_STOP_VALUE):
+                    break
+        except:
             continue
-    return False, added
+    return added_count
 
-async def collect_incremental(page: Page) -> list[tuple[str, str]]:
-    """
-    Incremental collector:
-      - ensure first required anchor exists + hover
-      - find/focus scroll container
-      - loop:
-          * collect visible anchors
-          * if bottom -> break
-          * try scroll by 100px; if no movement -> ArrowDown x10
-          * overlay mitigation occasionally
-      - return all collected pairs
-    """
-    # Wait initial load
-    with contextlib.suppress(Exception):
+async def collect_incremental(page: Page, cfg: dict, job: str, loc: str, seen_global: Set[str]) -> Tuple[int, bool]:
+    limit = int(cfg.get("LIMIT", 0) or 0)
+    try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
-    with contextlib.suppress(Exception):
-        await page.wait_for_load_state("networkidle", timeout=15000)
-
-    # FIRST anchor + hover
-    if not await _hover_first_required(page):
-        print("[INFO] No vacancies detected on this page (no FIRST //ul/li[@data-index]//a[@href]).")
-        return []
-
-    # Locate scroll target and focus
-    container_sel = await _locate_scroll_container_selector(page)
-    await _focus_scroll_target(page, container_sel)
-
-    results: List[Tuple[str, str]] = []
-    seen_local: Set[str] = set()
-    stalls = 0
-    sweeps_without_add = 0
-
+    except:
+        pass
+    if not await _hover_first(page):
+        log("Process started, but no anchors found")
+        return 0, False
+    results_in_run: List[Tuple[str,str]] = []
+    start = time.monotonic()
+    log("Process started to find jobs...")
+    total_new = await _scan_and_save(page, seen_global, job, loc, results_in_run)
+    limit_hit = (limit > 0 and total_new >= limit)
+    if limit_hit:
+        log("Finished", total=total_new)
+        return total_new, True
+    bottom_reached = False
     while True:
-        # 1) collect visible anchors
-        hit_stop, added = await _collect_visible_anchors(page, seen_local, results)
-        if hit_stop:
+        if time.monotonic() - start > cfg["MAX_LOOP_SECONDS"]:
+            print("[WARN] Loop timeout reached")
             break
-
-        # bottom?
-        if await _is_at_bottom(page, container_sel):
+        if await _is_at_bottom(page):
+            bottom_reached = True
             break
-
-        if added == 0:
-            sweeps_without_add += 1
-        else:
-            sweeps_without_add = 0
-
-        # 2) try scroll by 100px
-        moved = await _scroll_step_100(page, container_sel)
+        moved = await _scroll_step(page)
         if not moved:
-            stalls += 1
-            await _press_arrow_down_10(page)
-        else:
-            stalls = 0
+            await _press_down(page)
+        await asyncio.sleep(random.uniform(cfg["SLEEP_MIN"], cfg["SLEEP_MAX"]))
+        total_new += await _scan_and_save(page, seen_global, job, loc, results_in_run)
+        if limit > 0 and total_new >= limit:
+            limit_hit = True
+            break
+        if TARGET_STOP_VALUE and any(di == str(TARGET_STOP_VALUE) for di, _ in results_in_run):
+            break
+    if bottom_reached:
+        log("Scrolled down")
+    log("Finished", total=total_new)
+    return total_new, limit_hit
 
-        # mitigate & refocus occasionally
-        if stalls in (2, 4) or sweeps_without_add in (2, 4):
-            await _detect_and_close_overlays(page)
-            await _focus_scroll_target(page, container_sel)
-
-        # small human-like pause
-        await asyncio.sleep(random.uniform(0.06, 0.16))
-
-        # loop continues until bottom reached
-
-    # final sweep (grab anything newly visible at the very bottom)
-    await _collect_visible_anchors(page, seen_local, results)
-    return results
-
-# ------------------------------ Saver / Dedupe -------------------------------
-
-def save_if_new_href(data_index: str, url: str, seen_urls: Set[str],
-                     job_name: str, location: str) -> bool:
-    if not url:
-        return False
-    u = url.strip()
-    if u in seen_urls:
-        return False
-
-    append_jsonl(
-        LINKS_JSONL,
-        {
-            "id": f"jj-{data_index}",
-            "data_index": str(data_index),
-            "job_name": job_name,
-            "location": location,
-            "url": u,
-            "new_href": True,
-        },
-    )
-    seen_urls.add(u)
-    return True
-
-# -------------------------------------- Runner --------------------------------------
-
-async def collect_for(job_name: str, location: str, headful: bool, fail_fast: bool,
-                      allow_cookie_click: bool, allow_load_more_click: bool) -> None:
-    page: Page | None = None
-    browser: Browser | None = None
-    context: BrowserContext | None = None
+async def collect_for(job: str, loc: str, cfg: dict) -> bool:
+    page=None; browser=None; ctx=None
     try:
         state = load_json(STATE_JSON, {})
-        base_url = state.get("base_url") or "https://justjoin.it/"
-
+        base = state.get("base_url") or "https://justjoin.it/"
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=not headful)
-            ctx_kwargs = {}
-            if Path(STORAGE_STATE_JSON).exists():
-                ctx_kwargs["storage_state"] = str(STORAGE_STATE_JSON)
-            context = await browser.new_context(**ctx_kwargs)
-            page = await context.new_page()
-
-            search_url = build_search_url(base_url, job_name, location)
-            print(f"[INFO] Open search: {search_url}  (job='{job_name}', location='{location}')")
-
-            await page.goto(search_url, wait_until="domcontentloaded")
+            browser = await p.chromium.launch(headless=not cfg["HEADFUL"])
+            ctx = await browser.new_context(storage_state=str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None)
+            page = await ctx.new_page()
+            url = build_search_url(base, job, loc)
+            log("Opening search", url=url)
+            await page.goto(url, wait_until="domcontentloaded")
+            seen_global = preload_seen_urls()
+            added, limit_hit = await collect_incremental(page, cfg, job, loc, seen_global)
+            log("Done", added=added, total=len(seen_global))
             with contextlib.suppress(Exception):
-                await page.wait_for_load_state("networkidle", timeout=6000)
-
-            # cookies (click only if allowed)
-            await _accept_cookies_if_any(page, allow_cookie_click)
-
-            # incremental collect (hover -> collect/scroll loop)
-            pairs = await collect_incremental(page)
-
-            # save with global URL-dedupe
-            seen_urls = preload_seen_urls()
-            if not pairs:
-                print(f"[INFO] No collectable anchors for job='{job_name}', location='{location}'.")
-            else:
-                added = 0
-                for data_index, url in pairs:
-                    if save_if_new_href(data_index, url, seen_urls, job_name, location):
-                        added += 1
-                print(f"[OK] Added {added} NEW hrefs to {LINKS_JSONL}. Total known hrefs: {len(seen_urls)}")
-
-            with contextlib.suppress(Exception):
-                await context.storage_state(path=str(STORAGE_STATE_JSON))
-
+                await ctx.storage_state(path=str(STORAGE_STATE_JSON))
+            return limit_hit
     except Exception:
-        await async_handle_error(page, "s2_collect", f"collect_for[{job_name}|{location}]", fail_fast)
+        await async_handle_error(page, "s2_collect", f"{job}|{loc}", cfg["FAIL_FAST"])
+        return False
     finally:
-        await safe_close(context, browser)
-
-# -------------------------------------- Main ----------------------------------------
+        await safe_close(ctx, browser)
 
 async def main_async():
     cfg = load_config()
-    job_names = list(cfg.get("JOB_NAMES", DEFAULT_CONFIG["JOB_NAMES"]))
-    locations = list(cfg.get("LOCATIONS", DEFAULT_CONFIG["LOCATIONS"]))
-    headful = bool(cfg.get("HEADFUL", True))
-    target_idx = cfg.get("TARGET_INDEXES", None)
-    fail_fast = bool(cfg.get("FAIL_FAST", False))
-    allow_cookie_click = bool(cfg.get("ALLOW_COOKIE_CLICK", False))
-    allow_load_more_click = bool(cfg.get("ALLOW_LOAD_MORE_CLICK", False))
-
     global TARGET_STOP_VALUE
-    TARGET_STOP_VALUE = str(target_idx) if target_idx is not None else None
-
+    if cfg.get("TARGET_INDEXES"):
+        TARGET_STOP_VALUE = str(cfg["TARGET_INDEXES"])
     Path(LINKS_JSONL).parent.mkdir(parents=True, exist_ok=True)
     Path(LINKS_JSONL).touch(exist_ok=True)
-
-    run_no = 0
-    for li, location in enumerate(locations):
-        for ji, job_name in enumerate(job_names):
-            run_no += 1
-            print(f"\n=== RUN #{run_no}: job='{job_name}' | location='{location}' ===")
-            await collect_for(
-                job_name,
-                location,
-                headful=headful,
-                fail_fast=fail_fast,
-                allow_cookie_click=allow_cookie_click,
-                allow_load_more_click=allow_load_more_click
-            )
-
-            is_last = (li == len(locations)-1) and (ji == len(job_names)-1)
-            if not is_last:
-                delay = random.randint(300, 660)  # 5–11 minutes
-                print(f"[PAUSE] Waiting {delay} seconds before next run…")
-                await asyncio.sleep(delay)
+    for loc in cfg["LOCATIONS"]:
+        for job in cfg["JOB_NAMES"]:
+            limit_hit = await collect_for(job, loc, cfg)
+            if limit_hit:
+                wait = random.randint(11*60, 21*60)
+            else:
+                wait = random.randint(300, 660)
+            log("Waiting for next run", minutes=round(wait/60, 1))
+            await asyncio.sleep(wait)
 
 if __name__ == "__main__":
     asyncio.run(main_async())

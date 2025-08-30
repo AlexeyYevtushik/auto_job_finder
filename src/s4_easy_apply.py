@@ -1,39 +1,29 @@
-# src/s4_easy_apply.py
-# S4: Auto-complete "easy apply" forms on justjoin.it.
-# - Reads data/filtered_links.jsonl, processes rows where easy_apply=true AND processed=false
-# - Opens listing, clicks page-level Apply (opener) ONCE, waits for true application form (or popup),
-#   fills "Introduce yourself", verifies it was set, sets positive selects/combos, ticks consents,
-#   submits ONLY after verification + readiness, then waits for Application Confirmation.
-# - Sets processed=true ONLY when a confirmation is detected.
-
 import asyncio
 import json
 import re
+import random
 import traceback
 from contextlib import suppress
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Frame
 
 from .common import (
     DATA_DIR, ERRORS_DIR, SCREENSHOTS_DIR, STORAGE_STATE_JSON,
     read_jsonl, now_iso, human_sleep
 )
 
-# ---------- constants/paths ----------
 INPUT_JSONL = DATA_DIR / "filtered_links.jsonl"
 CONFIG_PATH = Path("config/config.json")
 
-# ---------- logging ----------
 def log(msg: str) -> None:
     print(f"[S4] {msg}", flush=True)
 
 def step(tag: str, msg: str) -> None:
     log(f"[{tag}] {msg}")
 
-# ---------- helpers ----------
 def safe_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", s or "item")
 
@@ -44,6 +34,7 @@ def load_config() -> Dict[str, Any]:
             "LIMIT": 0,
             "FAIL_FAST": False,
             "ALLOW_COOKIE_CLICK": True,
+            "ALLOW_SAMEPAGE_OPENER": False,
             "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
         }
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -78,7 +69,13 @@ def update_row_inplace(match_id_key: str, match_id_val, match_url_key: str, matc
         write_jsonl(INPUT_JSONL, rows)
     return updated
 
-# ---------- cookies ----------
+def get_pending_rows(limit: int) -> List[Dict[str, Any]]:
+    all_rows = list(read_jsonl(INPUT_JSONL))
+    pending = [r for r in all_rows if r.get("easy_apply") is True and r.get("processed") is False]
+    if limit and limit > 0:
+        return pending[:limit]
+    return pending
+
 async def maybe_accept_cookies(page: Page, total_wait_ms: int = 12000) -> bool:
     selectors = [
         "#onetrust-accept-btn-handler",
@@ -97,7 +94,6 @@ async def maybe_accept_cookies(page: Page, total_wait_ms: int = 12000) -> bool:
         "[class*='cookie'] button:has-text('OK')",
     ]
     texts = ["Accept all", "Accept", "Akceptuj", "Zgadzam", "OK", "Got it", "Rozumiem"]
-
     step("COOKIES", "check: start")
     waited = 0
     while waited <= total_wait_ms:
@@ -120,7 +116,6 @@ async def maybe_accept_cookies(page: Page, total_wait_ms: int = 12000) -> bool:
     step("COOKIES", "banner not found (ok)")
     return False
 
-# ---------- form detection ----------
 _APPLY_OPEN_TEXTS = [
     "Apply now", "Apply", "Send application", "Submit application",
     "Aplikuj", "Wyślij", "Wyślij aplikację", "Zgłoś kandydaturę",
@@ -142,7 +137,6 @@ async def _is_inside_form_or_dialog(loc) -> bool:
         return False
 
 async def _looks_like_submit(loc) -> bool:
-    """Exclude elements that are submit-like (defensive)."""
     try:
         return await loc.evaluate("""
             el => {
@@ -152,7 +146,6 @@ async def _looks_like_submit(loc) -> bool:
               if (type === 'submit') return true;
               if (tst.includes('submit')) return true;
               if (aria.includes('submit')) return true;
-              // if it's inside a FORM, it's not a page opener
               if (el.closest('form')) return true;
               return false;
             }
@@ -161,7 +154,6 @@ async def _looks_like_submit(loc) -> bool:
         return False
 
 async def find_page_apply_opener(page: Page):
-    """Find ONLY the button/link that OPENS the form (exclude elements inside a form/dialog or submit-like)."""
     for t in _APPLY_OPEN_TEXTS:
         locs = [
             page.get_by_role("button", name=re.compile(rf"\b{re.escape(t)}\b", re.I)),
@@ -183,7 +175,6 @@ async def find_page_apply_opener(page: Page):
                 return cand
             except Exception:
                 continue
-    # fallback by id/href hints; still exclude inside a form/dialog
     try:
         loc = page.locator("a[href*='#apply'], button[id*='apply'], a[id*='apply']")
         if await loc.count() > 0:
@@ -194,7 +185,7 @@ async def find_page_apply_opener(page: Page):
         pass
     return None
 
-async def _has_inputs_inside(scope: Page, root_css: str) -> bool:
+async def _has_inputs_inside(scope: Union[Page, Frame], root_css: str) -> bool:
     probes = [
         f"{root_css} textarea",
         f"{root_css} input[type='text']",
@@ -212,20 +203,15 @@ async def _has_inputs_inside(scope: Page, root_css: str) -> bool:
                 return True
     return False
 
-async def is_true_application_form(page: Page) -> bool:
-    """
-    TRUE app form = dialog or form having BOTH:
-    (a) a submit button with expected text AND (b) at least one input/textarea/select/combobox.
-    """
+async def is_true_application_form_on(scope: Union[Page, Frame]) -> bool:
     dialog_roots = ["[role='dialog']", ".modal", ".dialog", ".popup", ".MuiDialog-root", ".chakra-modal__content"]
     for dr in dialog_roots:
         for txt in _FORM_SUBMIT_TEXTS:
-            btn = page.locator(f"{dr} button:has-text('{txt}')")
+            btn = scope.locator(f"{dr} button:has-text('{txt}')")
             if await btn.count() > 0 and await btn.first.is_visible():
-                if await _has_inputs_inside(page, dr):
+                if await _has_inputs_inside(scope, dr):
                     return True
-
-    forms = page.locator("form")
+    forms = scope.locator("form")
     try:
         n = await forms.count()
     except Exception:
@@ -248,40 +234,54 @@ async def is_true_application_form(page: Page) -> bool:
             continue
     return False
 
-# ---------- confirmation detection ----------
+async def find_form_scope(page: Page) -> Optional[Union[Page, Frame]]:
+    if await is_true_application_form_on(page):
+        return page
+    for fr in page.frames:
+        with suppress(Exception):
+            if await is_true_application_form_on(fr):
+                return fr
+    return None
+
+async def is_true_application_form_anywhere(page: Page) -> bool:
+    if await is_true_application_form_on(page):
+        return True
+    for fr in page.frames:
+        with suppress(Exception):
+            if await is_true_application_form_on(fr):
+                return True
+    return False
+
 _CONFIRM_PATTERNS = [
     r"\bapplication confirmation\b",
     r"your application has been sent",
     r"\bhas been sent to\b",
-    r"\bapplication saved!?",
+    r"\bapplication saved!?\b",
     r"view application history",
     r"application (sent|submitted|completed|received)",
     r"thank you(\s+for (your )?application)?",
     r"we('|’)ve received your application",
     r"your application has been (sent|submitted|received)",
     r"we will contact you",
-    r"success(?!.*(payment|order))",
+    r"\bsuccess(?!.*(payment|order))\b",
     r"\ball set\b",
     r"\bsubmitted\b",
     r"\bapplied\b",
     r"\bconfirmation\b",
-    # PL
     r"dziękujemy( za (twoją )?aplikacj[ęe])?",
-    r"aplikacj[ae] wysłan[aeao]",
+    r"\baplikacj[ae] wysłan[aeao]\b",
     r"twoja aplikacja (została )?wysłan[aeao]",
     r"zgłoszenie (zostało )?wysłan[aeao]",
     r"przyjęliśmy twoją aplikacj[ęe]",
 ]
 _CONFIRM_URL_HINTS = ["applied", "application-sent", "application_submitted", "submitted", "thanks", "thank-you", "confirmation"]
-def _compile_rx_list(patterns: List[str]) -> List[re.Pattern]:
-    return [re.compile(p, re.I) for p in patterns]
-_COMPILED_CONFIRM = _compile_rx_list(_CONFIRM_PATTERNS)
+_COMPILED_CONFIRM = [re.compile(p, re.I) for p in _CONFIRM_PATTERNS]
 
-async def _matches_any_text(page: Page, regexes: List[re.Pattern], scope_css: Optional[str] = None) -> bool:
-    scope = page.locator(scope_css) if scope_css else page
+async def _matches_any_text(scope: Union[Page, Frame], regexes: List[re.Pattern], scope_css: Optional[str] = None) -> bool:
+    target = scope.locator(scope_css) if scope_css else scope
     try:
         for rx in regexes:
-            loc = scope.get_by_text(rx, exact=False)
+            loc = target.get_by_text(rx, exact=False)
             with suppress(Exception):
                 if await loc.count() > 0 and await loc.first.is_visible(timeout=400):
                     return True
@@ -289,8 +289,8 @@ async def _matches_any_text(page: Page, regexes: List[re.Pattern], scope_css: Op
         pass
     return False
 
-async def _dialog_title_is_confirmation(page: Page) -> bool:
-    js = """
+async def _dialog_title_is_confirmation(scope: Union[Page, Frame]) -> bool:
+    js = r"""
     () => {
       const dlg = document.querySelector('[role="dialog"]');
       if (!dlg) return false;
@@ -305,18 +305,18 @@ async def _dialog_title_is_confirmation(page: Page) -> bool:
     }
     """
     try:
-        return await page.evaluate(js)
+        return await scope.evaluate(js)
     except Exception:
         return False
 
-async def _any_success_dialog(page: Page) -> bool:
-    if await _dialog_title_is_confirmation(page):
+async def _any_success_dialog(scope: Union[Page, Frame]) -> bool:
+    if await _dialog_title_is_confirmation(scope):
         return True
     dialog_roots = ["[role='dialog']", ".modal", ".dialog", ".popup", ".MuiDialog-root", ".chakra-modal__content"]
     for dr in dialog_roots:
-        if await _matches_any_text(page, _COMPILED_CONFIRM, dr):
+        if await _matches_any_text(scope, _COMPILED_CONFIRM, dr):
             return True
-        dlg = page.locator(dr)
+        dlg = scope.locator(dr)
         try:
             if await dlg.count() == 0 or not await dlg.first.is_visible():
                 continue
@@ -324,43 +324,43 @@ async def _any_success_dialog(page: Page) -> bool:
             continue
         icon_like = dlg.locator("svg[aria-label*='success' i], [class*='success' i] svg, .icon-success, [data-status='success']")
         try:
-            if await icon_like.count() > 0 and not await _has_inputs_inside(page, dr):
+            if await icon_like.count() > 0 and not await _has_inputs_inside(scope, dr):
                 return True
         except Exception:
             pass
     return False
 
-async def _any_success_toast(page: Page) -> bool:
+async def _any_success_toast(scope: Union[Page, Frame]) -> bool:
     toasts = [".toast", ".Toastify__toast", ".chakra-toast", "[class*='toast']",
               ".MuiSnackbar-root", ".ant-message", ".ant-notification"]
     for t in toasts:
-        container = page.locator(t)
+        container = scope.locator(t)
         try:
             if await container.count() == 0 or not await container.first.is_visible():
                 continue
         except Exception:
             continue
-        if await _matches_any_text(page, _COMPILED_CONFIRM, t):
+        if await _matches_any_text(scope, _COMPILED_CONFIRM, t):
             return True
     try:
-        toast = page.get_by_text(re.compile(r"Application saved!?"))
+        toast = scope.get_by_text(re.compile(r"Application saved!?"))
         if await toast.count() > 0 and await toast.first.is_visible():
             return True
     except Exception:
         pass
     return False
 
-async def _url_looks_confirmed(page: Page) -> bool:
+async def _url_looks_confirmed(scope: Union[Page, Frame]) -> bool:
     with suppress(Exception):
-        url = page.url.lower()
+        url = scope.url.lower()
         for hint in _CONFIRM_URL_HINTS:
             if hint in url:
                 return True
     return False
 
-async def _body_inner_text_has_confirmation(page: Page) -> bool:
+async def _body_inner_text_has_confirmation(scope: Union[Page, Frame]) -> bool:
     try:
-        txt = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText : ''")
+        txt = await scope.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText : ''")
         low = txt.lower()
         for rx in _COMPILED_CONFIRM:
             if rx.search(low):
@@ -369,31 +369,36 @@ async def _body_inner_text_has_confirmation(page: Page) -> bool:
         pass
     return False
 
-async def detect_confirmation(page: Page) -> bool:
-    if await _any_success_dialog(page):
-        step("CONFIRM", "dialog matched -> OK")
+async def detect_confirmation_on(scope: Union[Page, Frame]) -> bool:
+    if await _any_success_dialog(scope):
         return True
-    if await _any_success_toast(page):
-        step("CONFIRM", "toast matched -> OK")
+    if await _any_success_toast(scope):
         return True
-    if await _url_looks_confirmed(page):
-        step("CONFIRM", "URL hint matched -> OK")
+    if await _url_looks_confirmed(scope):
         return True
-    if await _body_inner_text_has_confirmation(page):
-        step("CONFIRM", "body.innerText matched -> OK")
+    if await _body_inner_text_has_confirmation(scope):
         return True
     return False
 
-async def wait_for_confirmation(page: Page, checks: int = 40, delay_sec: float = 0.5) -> bool:
+async def detect_confirmation_anywhere(root: Union[Page, Frame]) -> bool:
+    page = root if isinstance(root, Page) else root.page
+    if await detect_confirmation_on(page):
+        return True
+    for fr in page.frames:
+        with suppress(Exception):
+            if await detect_confirmation_on(fr):
+                return True
+    return False
+
+async def wait_for_confirmation(root: Union[Page, Frame], checks: int = 180, delay_sec: float = 0.5) -> bool:
     for i in range(1, checks + 1):
-        if await detect_confirmation(page):
+        if await detect_confirmation_anywhere(root):
             step("CONFIRM", f"detected at check {i}/{checks}")
             return True
         await asyncio.sleep(delay_sec)
     step("CONFIRM", "no confirmation after waiting")
     return False
 
-# ---------- fill helpers ----------
 _INTRO_LABELS = [
     re.compile(r"introduce yourself", re.I),
     re.compile(r"message", re.I),
@@ -404,24 +409,21 @@ _INTRO_LABELS = [
 ]
 _INTRO_PLACEHOLDERS = ["Introduce yourself", "Message", "Cover letter", "Tell us", "Notes", "Wiadomość", "List motywacyjny"]
 
-async def fill_introduce_yourself(page: Page, intro_text: str) -> bool:
-    # 1) by accessible name
+async def fill_introduce_yourself(scope: Union[Page, Frame], intro_text: str) -> bool:
     for rx in _INTRO_LABELS:
-        loc = page.get_by_role("textbox", name=rx)
+        loc = scope.get_by_role("textbox", name=rx)
         if await loc.count() > 0:
             with suppress(Exception):
                 await loc.first.fill(intro_text, timeout=4000)
                 return True
-    # 2) by placeholder
     for ph in _INTRO_PLACEHOLDERS:
-        loc = page.locator(f"textarea[placeholder*='{ph}'], input[placeholder*='{ph}']")
+        loc = scope.locator(f"textarea[placeholder*='{ph}'], input[placeholder*='{ph}']")
         if await loc.count() > 0:
             with suppress(Exception):
                 await loc.first.fill(intro_text, timeout=4000)
                 return True
-    # 3) first visible textarea in dialog/form
-    for scope in ["[role='dialog']", "form"]:
-        loc = page.locator(f"{scope} textarea")
+    for r in ["[role='dialog']", "form"]:
+        loc = scope.locator(f"{r} textarea")
         if await loc.count() > 0:
             with suppress(Exception):
                 if await loc.first.is_visible():
@@ -432,28 +434,24 @@ async def fill_introduce_yourself(page: Page, intro_text: str) -> bool:
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
-async def confirm_intro_value(page: Page, intro_text: str) -> bool:
-    """Check that any candidate intro field now contains the intro_text."""
+async def confirm_intro_value(scope: Union[Page, Frame], intro_text: str) -> bool:
     target = _norm(intro_text)
-    # role=textbox fields with matching labels
     for rx in _INTRO_LABELS:
-        loc = page.get_by_role("textbox", name=rx)
+        loc = scope.get_by_role("textbox", name=rx)
         if await loc.count() > 0:
             with suppress(Exception):
                 val = await loc.first.input_value()
                 if _norm(val).find(target) >= 0:
                     return True
-    # placeholders
     for ph in _INTRO_PLACEHOLDERS:
-        loc = page.locator(f"textarea[placeholder*='{ph}'], input[placeholder*='{ph}']")
+        loc = scope.locator(f"textarea[placeholder*='{ph}'], input[placeholder*='{ph}']")
         if await loc.count() > 0:
             with suppress(Exception):
                 val = await loc.first.input_value()
                 if _norm(val).find(target) >= 0:
                     return True
-    # any textarea in dialog/form
-    for scope in ["[role='dialog']", "form"]:
-        loc = page.locator(f"{scope} textarea")
+    for r in ["[role='dialog']", "form"]:
+        loc = scope.locator(f"{r} textarea")
         if await loc.count() > 0:
             with suppress(Exception):
                 val = await loc.first.input_value()
@@ -461,20 +459,18 @@ async def confirm_intro_value(page: Page, intro_text: str) -> bool:
                     return True
     return False
 
-async def wait_intro_confirmed(page: Page, intro_text: str, checks: int = 8, delay_sec: float = 0.3) -> bool:
+async def wait_intro_confirmed(scope: Union[Page, Frame], intro_text: str, checks: int = 8, delay_sec: float = 0.3) -> bool:
     for _ in range(checks):
-        if await confirm_intro_value(page, intro_text):
+        if await confirm_intro_value(scope, intro_text):
             return True
         await asyncio.sleep(delay_sec)
     return False
 
-async def set_positive_selects_if_present(page: Page, max_to_set: int = 5) -> int:
+async def set_positive_selects_if_present(scope: Union[Page, Frame], max_to_set: int = 5) -> int:
     set_count = 0
     aff_rx = re.compile(r"^(yes|tak|agree|zgadzam|accept|consent|true)$", re.I)
-    scopes = ["[role='dialog']", "form"]
-
-    for scope in scopes:
-        selects = page.locator(f"{scope} select")
+    for r in ["[role='dialog']", "form"]:
+        selects = scope.locator(f"{r} select")
         try:
             n = await selects.count()
         except Exception:
@@ -501,9 +497,8 @@ async def set_positive_selects_if_present(page: Page, max_to_set: int = 5) -> in
                     set_count += 1
             except Exception:
                 continue
-
-    for scope in scopes:
-        combos = page.locator(f"{scope} [role='combobox']")
+    for r in ["[role='dialog']", "form"]:
+        combos = scope.locator(f"{r} [role='combobox']")
         try:
             n = await combos.count()
         except Exception:
@@ -517,7 +512,7 @@ async def set_positive_selects_if_present(page: Page, max_to_set: int = 5) -> in
                     continue
                 with suppress(Exception):
                     await cb.click()
-                items = page.locator("[role='option'], li[role='option'], div[role='option']")
+                items = scope.locator("[role='option'], li[role='option'], div[role='option']")
                 cnt = await items.count()
                 picked = False
                 for j in range(cnt):
@@ -532,22 +527,19 @@ async def set_positive_selects_if_present(page: Page, max_to_set: int = 5) -> in
                     except Exception:
                         continue
                 if not picked:
-                    with suppress(Exception):
-                        await page.keyboard.press("Escape")
+                    pass
             except Exception:
                 continue
     return set_count
 
-async def tick_consents_if_present(page: Page, max_to_tick: int = 3) -> int:
+async def tick_consents_if_present(scope: Union[Page, Frame], max_to_tick: int = 3) -> int:
     ticked = 0
     label_hints = [re.compile(r"consent|agree|accept|privacy|terms|rodo|gdpr", re.I)]
-
-    boxes = page.get_by_role("checkbox")
+    boxes = scope.get_by_role("checkbox")
     try:
         count = await boxes.count()
     except Exception:
         count = 0
-
     for i in range(count):
         if ticked >= max_to_tick:
             break
@@ -571,9 +563,8 @@ async def tick_consents_if_present(page: Page, max_to_tick: int = 3) -> int:
                 ticked += 1
         except Exception:
             continue
-
     if ticked < max_to_tick:
-        raw_boxes = page.locator("input[type='checkbox']")
+        raw_boxes = scope.locator("input[type='checkbox']")
         try:
             raw_count = await raw_boxes.count()
         except Exception:
@@ -603,35 +594,32 @@ async def tick_consents_if_present(page: Page, max_to_tick: int = 3) -> int:
                 continue
     return ticked
 
-# ---------- form readiness / completeness ----------
-async def get_active_form_scope(page: Page) -> Optional[str]:
+async def get_active_form_scope(scope: Union[Page, Frame]) -> Optional[str]:
     scopes = ["[role='dialog'] form", "[role='dialog']", "form"]
-    for scope in scopes:
+    for r in scopes:
         try:
-            root = page.locator(scope)
+            root = scope.locator(r)
             if await root.count() == 0 or not await root.first.is_visible():
                 continue
             has_submit = False
             for txt in _FORM_SUBMIT_TEXTS:
-                if await page.locator(f"{scope} button:has-text('{txt}')").count() > 0:
+                if await scope.locator(f"{r} button:has-text('{txt}')").count() > 0:
                     has_submit = True
                     break
             if has_submit:
-                return scope
+                return r
         except Exception:
             continue
     return None
 
-async def audit_form_completeness(page: Page) -> Dict[str, Any]:
-    scope = await get_active_form_scope(page)
-    if not scope:
+async def audit_form_completeness(scope: Union[Page, Frame]) -> Dict[str, Any]:
+    active_scope = await get_active_form_scope(scope)
+    if not active_scope:
         return {"ok": False, "required_total": 0, "missing": [{"type": "scope", "name": "", "reason": "scope_not_found"}], "scope": None}
-
-    report = await page.evaluate("""
+    report = await scope.evaluate(r"""
     (sel) => {
       const root = document.querySelector(sel);
       if (!root) return {ok:false, required_total:0, missing:[{type:'scope',name:'',reason:'root_not_found'}], scope: sel};
-
       const q = s => Array.from(root.querySelectorAll(s));
       const isReq = (el) => {
         if (el.disabled) return false;
@@ -646,23 +634,18 @@ async def audit_form_completeness(page: Page) -> Dict[str, Any]:
           const wrap = el.closest('label');
           if (wrap) labelText = wrap.textContent || '';
         }
-        const likely = /(\*|required|wymagane|obowiązkowe)/i.test(labelText || '');
+        const likely = /(\\*|required|wymagane|obowiązkowe)/i.test(labelText || '');
         return !!(attr || likely);
       };
-
       const result = {ok: true, required_total: 0, missing: [], scope: sel, _radioGroups: {}};
       const fields = q('input, textarea, select');
-
       for (const el of fields) {
         const tag = (el.tagName || '').toLowerCase();
         const type = (el.getAttribute('type') || '').toLowerCase();
         const name = el.getAttribute('name') || '';
         if (!isReq(el)) continue;
-
         result.required_total++;
-
         if (type === 'hidden') continue;
-
         if (tag === 'select') {
           const val = (el.value || '').trim();
           const text = el.options && el.selectedIndex >= 0 ? (el.options[el.selectedIndex].text || '') : '';
@@ -670,37 +653,30 @@ async def audit_form_completeness(page: Page) -> Dict[str, Any]:
           if (!val || badText) result.missing.push({type:'select', name, reason:'empty'});
           continue;
         }
-
         if (type === 'checkbox') {
           if (!el.checked) result.missing.push({type:'checkbox', name, reason:'unchecked'});
           continue;
         }
-
         if (type === 'radio') {
           if (!name) { result.missing.push({type:'radio', name:'', reason:'no-name'}); continue; }
           (result._radioGroups[name] ||= []).push(el.checked);
           continue;
         }
-
         if (type === 'file') {
           if (!el.files || el.files.length === 0) result.missing.push({type:'file', name, reason:'no-file'});
           continue;
         }
-
         const val = (el.value || '').trim();
         if (!val) result.missing.push({type: type || tag, name, reason:'empty'});
       }
-
       for (const [g, checks] of Object.entries(result._radioGroups)) {
         if (!checks.some(Boolean)) result.missing.push({type:'radio', name:g, reason:'none-checked'});
       }
       delete result._radioGroups;
-
       result.ok = result.missing.length === 0;
       return result;
     }
-    """, scope)
-
+    """, active_scope)
     return {
         "ok": bool(report.get("ok")),
         "required_total": int(report.get("required_total", 0)),
@@ -708,33 +684,26 @@ async def audit_form_completeness(page: Page) -> Dict[str, Any]:
         "scope": report.get("scope"),
     }
 
-async def is_form_ready_to_submit(page: Page) -> Tuple[bool, Dict[str, Any]]:
-    report = await audit_form_completeness(page)
+async def is_form_ready_to_submit(scope: Union[Page, Frame]) -> Tuple[bool, Dict[str, Any]]:
+    report = await audit_form_completeness(scope)
     return report["ok"], report
 
-async def click_final_apply_in_form(page: Page) -> bool:
-    """
-    Robustly click the in-form Apply:
-    - Prefer last visible, enabled button with expected text within the active form/dialog.
-    - Scroll into view; try normal click, then JS click fallback.
-    """
-    scope = await get_active_form_scope(page)
-    if not scope:
+async def click_final_apply_in_form(scope: Union[Page, Frame]) -> bool:
+    active_scope = await get_active_form_scope(scope)
+    if not active_scope:
         return False
-
     candidates: List[str] = []
     for txt in _FORM_SUBMIT_TEXTS:
-        candidates.append(f"{scope} button:has-text('{txt}')")
-        candidates.append(f"{scope} [role='button']:has-text('{txt}')")
+        candidates.append(f"{active_scope} button:has-text('{txt}')")
+        candidates.append(f"{active_scope} [role='button']:has-text('{txt}')")
     candidates += [
-        f"{scope} button[type='submit']",
-        f"{scope} [data-testid*='submit']",
-        f"{scope} button[class*='MuiButton-root']",
+        f"{active_scope} button[type='submit']",
+        f"{active_scope} [data-testid*='submit']",
+        f"{active_scope} button[class*='MuiButton-root']",
     ]
-
     matches = None
     for sel in candidates:
-        loc = page.locator(sel)
+        loc = scope.locator(sel)
         try:
             if await loc.count() > 0:
                 matches = loc
@@ -743,7 +712,6 @@ async def click_final_apply_in_form(page: Page) -> bool:
             continue
     if not matches:
         return False
-
     count = await matches.count()
     for idx in reversed(range(count)):
         btn = matches.nth(idx)
@@ -769,102 +737,104 @@ async def click_final_apply_in_form(page: Page) -> bool:
             continue
     return False
 
-async def click_final_apply_if_ready(page: Page) -> Tuple[bool, Dict[str, Any]]:
-    ready, report = await is_form_ready_to_submit(page)
+async def click_final_apply_if_ready(scope: Union[Page, Frame]) -> Tuple[bool, Dict[str, Any]]:
+    ready, report = await is_form_ready_to_submit(scope)
     if not ready:
         return False, report
-    clicked = await click_final_apply_in_form(page)
+    clicked = await click_final_apply_in_form(scope)
     return clicked, report
 
-# ---------- core: open form (ONE CLICK ONLY) ----------
-async def open_application_form(page: Page, allow_cookie_click: bool) -> Tuple[bool, Page]:
-    """
-    Click the PAGE-LEVEL Apply opener **ONCE** unless a TRUE form is already visible.
-    Handles popup or same-page form. Never clicks the final submit.
-    Returns (form_opened, active_page).
-    """
-    active = page
-
+async def open_application_form(page: Page, allow_cookie_click: bool, allow_samepage_opener: bool = False) -> Tuple[bool, Union[Page, Frame]]:
+    active: Union[Page, Frame] = page
     if allow_cookie_click:
         with suppress(Exception):
-            await maybe_accept_cookies(active)
-
-    # If already visible, no opener click
-    if await is_true_application_form(active):
+            await maybe_accept_cookies(page)
+    pre = await find_form_scope(page)
+    if pre:
         step("FORM", "true form already visible -> OK")
-        return True, active
-
-    # Find opener ONCE
-    opener = await find_page_apply_opener(active)
+        return True, pre
+    opener = await find_page_apply_opener(page)
     if not opener:
         step("FORM", "opener not found -> cannot open form")
-        return False, active
-
-    # Click opener ONCE
-    step("FORM", "opener found -> single click")
-    before_url = ""
-    with suppress(Exception):
-        before_url = active.url
-
+        for i in range(1, 11):
+            pre2 = await find_form_scope(page)
+            if pre2:
+                step("FORM", f"form appeared without opener (check {i}/10) -> OK")
+                return True, pre2
+            await asyncio.sleep(0.5)
+        return False, page
+    step("FORM", "opener found -> try popup click")
     popup: Optional[Page] = None
     try:
-        async with active.context.expect_page(timeout=2500) as popup_info:
+        async with page.context.expect_page(timeout=2500) as popup_info:
             with suppress(Exception):
                 await opener.scroll_into_view_if_needed()
                 await opener.hover()
             await opener.click(timeout=5000)
         popup = await popup_info.value
     except Exception:
-        with suppress(Exception):
-            await opener.click(timeout=3000)
-        with suppress(Exception):
-            await opener.evaluate("el => el.click()")
-
+        popup = None
     if popup:
         active = popup
         step("FORM", "popup detected -> switched")
         with suppress(Exception):
-            await active.wait_for_load_state("domcontentloaded", timeout=8000)
+            await popup.wait_for_load_state("domcontentloaded", timeout=8000)
         with suppress(Exception):
-            await active.wait_for_load_state("networkidle", timeout=8000)
+            await popup.wait_for_load_state("networkidle", timeout=8000)
         if allow_cookie_click:
             with suppress(Exception):
-                await maybe_accept_cookies(active)
-    else:
-        with suppress(Exception):
-            after_url = active.url
-            if after_url != before_url:
-                step("FORM", f"same-page opener clicked, URL changed: {before_url} -> {after_url}")
-            else:
-                step("FORM", "same-page opener clicked, URL unchanged (in-page dialog likely)")
-
-    # Wait up to ~5s for the true form to appear
+                await maybe_accept_cookies(popup)
+        for i in range(1, 11):
+            sc = await find_form_scope(popup)
+            if sc:
+                step("FORM", f"true form visible in popup (check {i}/10) -> OK")
+                return True, sc
+            await asyncio.sleep(0.5)
+        step("FORM", "true application form did not appear in popup")
+        return False, popup
+    if not allow_samepage_opener:
+        step("FORM", "no popup; same-page opener disallowed -> waiting for form without clicking")
+        for i in range(1, 11):
+            sc = await find_form_scope(page)
+            if sc:
+                step("FORM", f"true form visible (check {i}/10) -> OK")
+                return True, sc
+            await asyncio.sleep(0.5)
+        step("FORM", "true application form not visible without same-page click")
+        return False, page
+    step("FORM", "no popup; same-page opener allowed -> clicking")
+    with suppress(Exception):
+        await opener.scroll_into_view_if_needed()
+        await opener.hover()
+    with suppress(Exception):
+        await opener.click(timeout=3000)
+    with suppress(Exception):
+        await opener.evaluate("el => el.click()")
     for i in range(1, 11):
-        if await is_true_application_form(active):
+        sc = await find_form_scope(page)
+        if sc:
             step("FORM", f"true form visible (check {i}/10) -> OK")
-            return True, active
+            return True, sc
         await asyncio.sleep(0.5)
+    step("FORM", "true application form did not appear after same-page click")
+    return False, page
 
-    step("FORM", "true application form did not appear after single opener click")
-    return False, active
-
-# ---------- per row ----------
 async def process_one(
     ctx: BrowserContext,
     row: Dict[str, Any],
     intro_text: str,
     fail_fast: bool,
     allow_cookie_click: bool,
+    allow_samepage_opener: bool,
 ) -> None:
     if not (row.get("easy_apply") is True and row.get("processed") is False):
         return
     url = row.get("url")
     if not url:
         return
-
     rid = row.get("id") or url
     base_page: Optional[Page] = None
-    active_page: Optional[Page] = None
+    active_scope: Optional[Union[Page, Frame]] = None
     log_row = {
         "last_attempt_at": now_iso(),
         "s4_form_found": False,
@@ -879,10 +849,8 @@ async def process_one(
         "s4_confirmation": False,
         "s4_error": None,
     }
-
     id_key, url_key = "id", "url"
     id_val, url_val = row.get("id"), row.get("url")
-
     step("ROW", f"start: {rid}")
     try:
         step("NAV", f"goto: {url}")
@@ -890,125 +858,114 @@ async def process_one(
         await base_page.goto(url, wait_until="domcontentloaded", timeout=30000)
         with suppress(Exception):
             await base_page.wait_for_load_state("networkidle", timeout=8000)
-
-        # 1) OPEN FORM (single opener click; never submit)
-        step("FORM", "open: start (single opener)")
-        form_open, active_page = await open_application_form(base_page, allow_cookie_click=allow_cookie_click)
+        step("FORM", "open: start")
+        form_open, active_scope = await open_application_form(
+            base_page,
+            allow_cookie_click=allow_cookie_click,
+            allow_samepage_opener=allow_samepage_opener
+        )
         log_row["s4_form_found"] = form_open
-        if not form_open or not active_page:
+        if not form_open or not active_scope:
             raise RuntimeError("Could not open a TRUE application form (opener not clicked or form not shown)")
-
-        # 2) FILL INTRO
         step("FILL", "introduce-yourself: start")
-        log_row["s4_introduce_filled"] = await fill_introduce_yourself(active_page, intro_text)
+        log_row["s4_introduce_filled"] = await fill_introduce_yourself(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'OK' if log_row['s4_introduce_filled'] else 'not found'}")
-
-        # 2.1) VERIFY INTRO (retry once if needed)
         step("FILL", "introduce-yourself: verify")
-        log_row["s4_intro_verified"] = await wait_intro_confirmed(active_page, intro_text)
+        log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         if not log_row["s4_intro_verified"] and log_row["s4_introduce_filled"]:
             step("FILL", "introduce-yourself: re-fill & verify again")
             with suppress(Exception):
-                await fill_introduce_yourself(active_page, intro_text)
-            log_row["s4_intro_verified"] = await wait_intro_confirmed(active_page, intro_text)
-
+                await fill_introduce_yourself(active_scope, intro_text)
+            log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'VERIFIED' if log_row['s4_intro_verified'] else 'NOT VERIFIED'}")
-
-        # 3) OTHER FIELDS
         step("FILL", "positive-selects: start")
-        log_row["s4_selects_set"] = await set_positive_selects_if_present(active_page)
+        log_row["s4_selects_set"] = await set_positive_selects_if_present(active_scope)
         step("FILL", f"positive-selects: set={log_row['s4_selects_set']}")
-
         step("FILL", "consents: start")
-        log_row["s4_consents_ticked"] = await tick_consents_if_present(active_page)
+        log_row["s4_consents_ticked"] = await tick_consents_if_present(active_scope)
         step("FILL", f"consents: ticked={log_row['s4_consents_ticked']}")
-
-        # 4) READINESS + ONLY THEN SUBMIT
-        step("SUBMIT", "readiness check: start")
-        ready, ready_report = await is_form_ready_to_submit(active_page)
-        log_row["s4_form_ready"] = ready
-        log_row["s4_form_ready_missing"] = ready_report.get("missing", [])
-        log_row["s4_form_required_total"] = ready_report.get("required_total", 0)
-        step("SUBMIT", f"readiness: {'READY' if ready else 'NOT READY'}; "
-                       f"required_total={log_row['s4_form_required_total']}; "
-                       f"missing={log_row['s4_form_ready_missing']}")
-
-        if ready and log_row["s4_intro_verified"]:
-            step("SUBMIT", "click final submit: start")
-            log_row["s4_submit_clicked"], _ = await click_final_apply_if_ready(active_page)
-            step("SUBMIT", f"click final submit: {'OK' if log_row['s4_submit_clicked'] else 'NOT CLICKED'}")
-        else:
-            if not log_row["s4_intro_verified"]:
-                step("SUBMIT", "blocked: intro not verified -> skip submit")
-            else:
-                step("SUBMIT", "blocked: form not ready -> skip submit")
-
-        # 5) CONFIRMATION (modal/toast/URL/body)
-        step("CONFIRM", "wait: start")
-        log_row["s4_confirmation"] = await wait_for_confirmation(active_page)
-        step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
-
+        if log_row["s4_intro_verified"]:
+            step("SUBMIT", "try submit immediately")
+            quick_clicked = await click_final_apply_in_form(active_scope)
+            log_row["s4_submit_clicked"] = quick_clicked
+            if quick_clicked:
+                step("SUBMIT", "click final submit: OK")
+                step("CONFIRM", "wait: start")
+                log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
+                step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
+        if not log_row["s4_submit_clicked"] and not log_row["s4_confirmation"]:
+            step("SUBMIT", "readiness check: start")
+            ready, ready_report = await is_form_ready_to_submit(active_scope)
+            log_row["s4_form_ready"] = ready
+            log_row["s4_form_ready_missing"] = ready_report.get("missing", [])
+            log_row["s4_form_required_total"] = ready_report.get("required_total", 0)
+            if not ready and any(m.get("reason") == "scope_not_found" for m in log_row["s4_form_ready_missing"]):
+                step("SUBMIT", "form scope not found -> check confirmation immediately")
+                if await detect_confirmation_anywhere(active_scope):
+                    log_row["s4_confirmation"] = True
+                else:
+                    log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
+            step("SUBMIT", f"readiness: {'READY' if ready else 'NOT READY'}; required_total={log_row['s4_form_required_total']}; missing={log_row['s4_form_ready_missing']}")
+            if not log_row["s4_confirmation"]:
+                if ready and log_row["s4_intro_verified"]:
+                    step("SUBMIT", "click final submit: start")
+                    log_row["s4_submit_clicked"], _ = await click_final_apply_if_ready(active_scope)
+                    step("SUBMIT", f"click final submit: {'OK' if log_row['s4_submit_clicked'] else 'NOT CLICKED'}")
+                else:
+                    if not log_row["s4_intro_verified"]:
+                        step("SUBMIT", "blocked: intro not verified -> skip submit")
+                    elif not ready:
+                        step("SUBMIT", "blocked: form not ready -> skip submit")
+                if not log_row["s4_confirmation"]:
+                    step("CONFIRM", "wait: start")
+                    log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
+                    step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
         if log_row["s4_confirmation"]:
             step("ROW", f"Application Completed -> {rid}")
-
         patch = {**log_row}
         if log_row["s4_confirmation"]:
             patch["processed"] = True
-
         updated = update_row_inplace(id_key, id_val, url_key, url_val, patch)
         if not updated:
             step("WARN", "row patch did not match any record (check id/url).")
-
     except Exception as e:
         log_row["s4_error"] = f"{type(e).__name__}: {e}"
         step("ERROR", log_row["s4_error"])
         update_row_inplace(id_key, id_val, url_key, url_val, {**log_row})
-
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ERRORS_DIR.mkdir(parents=True, exist_ok=True)
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         png = SCREENSHOTS_DIR / f"s4_{safe_filename(rid)}_{ts}.png"
         txt = ERRORS_DIR / f"s4_{safe_filename(rid)}_{ts}.txt"
         with suppress(Exception):
-            if active_page and not active_page.is_closed():
-                await active_page.screenshot(path=str(png), full_page=True)
+            if isinstance(active_scope, Page) and not active_scope.is_closed():
+                await active_scope.screenshot(path=str(png), full_page=True)
             elif base_page and not base_page.is_closed():
                 await base_page.screenshot(path=str(png), full_page=True)
         with txt.open("w", encoding="utf-8") as f:
             f.write(f"TIME: {now_iso()}\nURL: {url}\n\nTRACEBACK:\n{traceback.format_exc()}\n")
-
         if fail_fast:
             raise
     finally:
         with suppress(Exception):
-            if active_page and not active_page.is_closed():
-                await active_page.close()
+            if isinstance(active_scope, Page) and not active_scope.is_closed():
+                await active_scope.close()
         with suppress(Exception):
             if base_page and not base_page.is_closed():
                 await base_page.close()
         step("ROW", f"end: {rid}")
 
-# ---------- runner ----------
 async def run():
     cfg = load_config()
     headful = bool(cfg.get("HEADFUL", True))
-    limit = int(cfg.get("LIMIT", 0))  # 0 = all
+    limit = int(cfg.get("LIMIT", 0))
     fail_fast = bool(cfg.get("FAIL_FAST", False))
     intro_text = str(cfg.get("INTRODUCE_YOURSELF", "")).strip()
     allow_cookie_click = bool(cfg.get("ALLOW_COOKIE_CLICK", True))
-
+    allow_samepage_opener = bool(cfg.get("ALLOW_SAMEPAGE_OPENER", False))
     INPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
     INPUT_JSONL.touch(exist_ok=True)
-
-    rows_all = list(read_jsonl(INPUT_JSONL))
-    rows = [r for r in rows_all if r.get("easy_apply") is True and r.get("processed") is False]
-    if limit > 0:
-        rows = rows[:limit]
-
-    step("RUN", f"rows to process: {len(rows)}")
-
     storage_state = str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None
-
     async with async_playwright() as p:
         browser: Browser = await p.chromium.launch(
             headless=not headful,
@@ -1019,18 +976,31 @@ async def run():
             ctx_kwargs["storage_state"] = storage_state
         ctx: BrowserContext = await browser.new_context(**ctx_kwargs)
         ctx.set_default_timeout(15000)
-
-        for idx, row in enumerate(rows, 1):
-            step("RUN", f"row {idx}/{len(rows)}")
-            await process_one(
-                ctx,
-                row,
-                intro_text=intro_text,
-                fail_fast=fail_fast,
-                allow_cookie_click=allow_cookie_click,
-            )
-            human_sleep(160, 320)
-
+        batch_no = 0
+        while True:
+            pending = get_pending_rows(limit)
+            total_left = len(get_pending_rows(0))
+            if not pending:
+                step("RUN", "no pending rows (easy_apply=true & processed=false) -> done")
+                break
+            batch_no += 1
+            step("RUN", f"batch #{batch_no}: to process now = {len(pending)} (total pending = {total_left})")
+            for idx, row in enumerate(pending, 1):
+                step("RUN", f"row {idx}/{len(pending)} in batch #{batch_no}")
+                await process_one(
+                    ctx,
+                    row,
+                    intro_text=intro_text,
+                    fail_fast=fail_fast,
+                    allow_cookie_click=allow_cookie_click,
+                    allow_samepage_opener=allow_samepage_opener,
+                )
+                human_sleep(160, 320)
+            if limit <= 0:
+                step("RUN", "LIMIT<=0 -> processed all once, exiting")
+                break
+            step("RUN", "batch pause: 10–21 minutes (await asyncio.sleep)")
+            await asyncio.sleep(random.uniform(600, 1260))
         await ctx.close()
         await browser.close()
     step("RUN", "done")
