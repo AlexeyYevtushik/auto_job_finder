@@ -1,3 +1,15 @@
+# ---------------------------------------------------------------------------
+# Purpose: Manually log into justjoin.it and persist Playwright storage state.
+# Steps:
+# 1) Parse CLI args (base URL, wait, headful, fail-fast).
+# 2) Launch browser/context and open base URL.
+# 3) If not logged in, wait (polling) up to --wait-seconds for manual login.
+# 4) On success, save storage_state.json.
+# 5) Update data/state.json with base_url, storage_state path, timestamp, method.
+# 6) On error, capture screenshot/trace via handle_error.
+# 7) Always close context/browser.
+# ---------------------------------------------------------------------------
+
 import argparse
 from pathlib import Path
 from .common import (
@@ -7,12 +19,9 @@ from .common import (
 
 def main():
     parser = argparse.ArgumentParser(description="Manual login to justjoin.it and save state/base_url")
-    parser.add_argument("--base-url", default="https://justjoin.it/",
-                        help="Base URL to open first")
-    parser.add_argument("--wait-seconds", type=int, default=180,
-                        help="How long to wait for you to finish login (seconds)")
-    parser.add_argument("--headful", type=str, default="true",
-                        help="true/false")
+    parser.add_argument("--base-url", default="https://justjoin.it/", help="Base URL to open first")
+    parser.add_argument("--wait-seconds", type=int, default=360, help="How long to wait for you to finish login (seconds)")
+    parser.add_argument("--headful", type=str, default="true", help="true/false")
     parser.add_argument("--fail-fast", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -22,7 +31,6 @@ def main():
 
     try:
         page.goto(args.base_url, wait_until="domcontentloaded")
-        # Если уже логин, сохраняем сразу
         if not is_logged_in(page):
             print(f"[INFO] Please log in manually. Waiting up to {args.wait_seconds}s...")
             total = args.wait_seconds
@@ -34,7 +42,6 @@ def main():
                 total -= step
             if not is_logged_in(page):
                 raise RuntimeError("Login not completed in time.")
-
         save_storage_state(context)
         state = load_json(STATE_JSON, {})
         state.update({
