@@ -3,7 +3,7 @@
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
   "INTRODUCE_YOURSELF": "Github: _your_link_to_github_\nLinkedIn: _your_link_to_linkedin_",
   
-  "LOCATIONS": ["remote"], 
+  "LOCATIONS": ["remote", "poland-remote", "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana", "lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw", "remote", "kyiv", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "rzeszow",  "bydgoszcz", "czestochowa", "olsztyn", "nowy-sacz", "torun", "kalisz", "tarnow", "opole", "koszalin", "plock", "stalowa-wola", "przemysl", "slupsk", "mielec", "konin", "wloclawek", "krosno", "gniezno", "walbrzych", "stargard", "kwidzyn", "zamosc", "elblag"], 
   "REQUIRE_CONFIRMATION": true,
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
@@ -13,11 +13,11 @@
   "ALLOW_SAMEPAGE_OPENER": false,
   "PIPELINE": {
     "SEQ": "s1,s2x2,s3,s4,s6",
-    "SLEEP_SECONDS": 5,
+    "SLEEP_SECONDS": 60,
     "KEEP_GOING": false,
     "FORCE_S1": false
   },
 
   
-  "TESTED_LOCATIONS": ["kielce", "krakow", "radom", "warszawa", "siedlce", "lublana","lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw","remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan"]
+  "TESTED_LOCATIONS": [ "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana", "lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw", "remote", "kyiv", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "rzeszow",  "bydgoszcz", "czestochowa", "olsztyn", "nowy-sacz", "torun", "kalisz", "tarnow", "opole", "koszalin", "plock", "stalowa-wola", "przemysl", "slupsk", "mielec", "konin", "wloclawek", "krosno", "gniezno", "walbrzych", "stargard", "kwidzyn", "zamosc", "elblag"]
 }
