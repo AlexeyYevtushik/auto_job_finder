@@ -1,25 +1,23 @@
 {
   "JOB_NAMES": ["QA Automation"],
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
-  "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
+  "INTRODUCE_YOURSELF": "Github: _your_link_to_github_\nLinkedIn: _your_link_to_linkedin_",
   
-  "LOCATIONS": ["kielce", "krakow", "radom", "warszawa", "siedlce", "lublana","remote"], 
+  "LOCATIONS": ["remote"], 
   "REQUIRE_CONFIRMATION": true,
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
   "FAIL_FAST": false,
-  "LIMIT": 2,
+  "LIMIT": 10,
   "ALLOW_COOKIE_CLICK": true,
   "ALLOW_SAMEPAGE_OPENER": false,
-  {
   "PIPELINE": {
     "SEQ": "s1,s2x2,s3,s4,s6",
     "SLEEP_SECONDS": 5,
     "KEEP_GOING": false,
     "FORCE_S1": false
-    }
   },
 
   
-  "TESTED_LOCATIONS": ["lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw","remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan"]
+  "TESTED_LOCATIONS": ["kielce", "krakow", "radom", "warszawa", "siedlce", "lublana","lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw","remote", "kyiv", "poland-remote", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan"]
 }
