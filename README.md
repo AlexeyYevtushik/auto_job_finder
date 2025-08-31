@@ -29,10 +29,11 @@ playwright install --with-deps
 python -m src.run_pipeline
 ```
 First run will take a lot of time (1 - 3 hours), after finish it will close: 
-1) Run
-2) Login to justjoin.it in opened Chromium browser (you have 5 minutes to login)
-3) Wait (sometimes Chromium browsers will appear - finds link to vacansies, checks vacansy, easy apply vacancy scripts). 
-4) In data/manual_work.jsonl you will have final vacansies urls to work manually (Temporary, planning browser_use)   
+1) Run.
+2) Log in to justjoin.it in an open Chromium browser (you have 5 minutes to log in).
+3) Wait (sometimes Chromium browsers will appear - find links to vacancies, check vacancies and easy apply vacancy scripts). 
+4) In data/manual_work.jsonl, you will have final vacancies URLs to work manually (Temporary, planning browser_use).
+5) Next day or week - run it again. It will take much less time, as it works only with new vacancies.
 
 ## Status:
-S5 - Create possibility to apply by browser_use
+S5 - Create a possibility to apply by browser_use
