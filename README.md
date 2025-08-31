@@ -4,7 +4,7 @@
 
 Auto Job Finder is a minimal agent that can handle thousands of job postings on justjoin.it. It filters vacancies by keywords, automatically applies to relevant ones via Easy Apply, and prepares the rest for manual submission. (Plan) The project also integrates with browser_use to support external application forms.
 
-##How to prepare to run
+## How to prepare to run
 1. Download Python   
    - Download Python [Windows/macOS/Linux] (https://www.python.org/downloads/)   
    - Install Python on Windows, check **"Add Python to PATH"** during installation.
@@ -24,7 +24,7 @@ playwright install --with-deps
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
   "INTRODUCE_YOURSELF": "Github: _your_link_to_github_\nLinkedIn: _your_link_to_linkedin_",
 ```
-##How to run
+## How to run
 ```markdown
 python -m src.run_pipeline
 ```
