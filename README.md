@@ -28,7 +28,7 @@ playwright install --with-deps
 ```markdown
 python -m src.run_pipeline
 ```
-First run will take a lot of time (1 - 3 hours), after finish it will close: 
+First run will take a lot of time (3 - 5 hours), after finish it will close: 
 1) Run.
 2) Log in to justjoin.it in an open Chromium browser (you have 5 minutes to log in).
 3) Wait (sometimes Chromium browsers will appear - find links to vacancies, check vacancies and easy apply vacancy scripts). 
