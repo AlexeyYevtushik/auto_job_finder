@@ -373,6 +373,14 @@ async def run_with_config():
     limit     = int(cfg.get("LIMIT", 0))
     keywords  = normalize_keywords(cfg.get("KEYWORDS"))
     storage_state = str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None
+
+    # --- новые параметры ожиданий из конфига (в секундах) + дефолты ---
+    short_min = int(cfg.get("SHORT_TIMEOUT_MIN", 60))   # раньше было human_sleep(120, 260)
+    short_max = int(cfg.get("SHORT_TIMEOUT_MAX", 180))
+    long_min  = int(cfg.get("LONG_TIMEOUT_MIN", 300))    # раньше было 15–25 минут
+    long_max  = int(cfg.get("LONG_TIMEOUT_MAX", 660))
+    # ------------------------------------------------------------------
+
     async with async_playwright() as p:
         browser: Browser = await p.chromium.launch(
             headless=not headful,
@@ -383,6 +391,7 @@ async def run_with_config():
             ctx_kwargs["storage_state"] = storage_state
         ctx: BrowserContext = await browser.new_context(**ctx_kwargs)
         ctx.set_default_timeout(15000)
+
         batch_num = 0
         while True:
             rows = take_new_links(limit)
@@ -390,8 +399,10 @@ async def run_with_config():
                 if batch_num == 0:
                     print("[INFO] No new links with new_href=true found.")
                 break
+
             batch_num += 1
             print(f"[S3] === BATCH #{batch_num}: processing {len(rows)} item(s) ===")
+
             for idx, row in enumerate(rows, start=1):
                 ok = False
                 try:
@@ -400,18 +411,24 @@ async def run_with_config():
                     ok = False
                 if ok:
                     mark_link_consumed(row)
-                human_sleep(120, 260)
+
+                await asyncio.sleep(random.uniform(short_min, short_max))
+
             has_more = bool(take_new_links(1))
             if has_more:
-                print("[S3] Batch done. Waiting 15–25 minutes before next batch...")
+                print(f"[S3] Batch done. Waiting {int(long_min//60)}–{int(long_max//60)} minutes before next batch...")
                 has_more = bool(take_new_links(1))
+
             if has_more:
-                wait_s = random.uniform(900, 1500)
-                print(f"[S3] Batch done. Waiting {int(wait_s//60)}–{int(wait_s//60)} minutes "
-                    f"({int(wait_s)} s) before next batch...")
+                wait_s = random.uniform(long_min, long_max)
+                print(
+                    f"[S3] Batch done. Waiting ~{int(wait_s//60)} minutes "
+                    f"({int(wait_s)} s) before next batch..."
+                )
                 await asyncio.sleep(wait_s)
             else:
                 print("[S3] All new_href:true links are processed.")
+
         await ctx.close()
         await browser.close()
 

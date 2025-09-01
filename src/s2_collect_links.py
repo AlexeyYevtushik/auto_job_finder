@@ -9,15 +9,14 @@
 # - After each scroll, scans anchors //ul/li[@data-index]//a[@href].
 # - Deduplicates globally (data/links.jsonl) and locally in run.
 # - Saves new rows: {id, data_index, job_name, location, url, new_href:true}.
-# - Stops when LIMIT reached, bottom reached, or timeout.
-# - After each run waits: 11–21 min if limit hit, else 5–11 min.
+# - Stops when LIMIT reached (strictly > LIMIT to mark limit_hit), bottom, or timeout.
+# - After each run waits: SHORT or LONG timeout depending on limit_hit.
 # - Saves screenshots + error trace if exceptions (errors/, screenshots/).
 # - Updates storage_state.json for session persistence.
 # - Safe close of context/browser always.
 # - Idempotent: does not duplicate existing URLs.
 # - Run via: python -m src.s2_collect_links
-# ----------------------------------------------------------------------------- 
-
+# -----------------------------------------------------------------------------
 
 import os, json, urllib.parse, random, asyncio, contextlib, traceback, time
 from typing import List, Tuple, Set, Optional
@@ -37,10 +36,14 @@ DEFAULT_CONFIG = {
     "TARGET_INDEXES": 1000,
     "FAIL_FAST": True,
     "ALLOW_COOKIE_CLICK": False,
-    "MAX_LOOP_SECONDS": 180,
+    "MAX_LOOP_SECONDS": 320,
     "SLEEP_MIN": 0.06,
     "SLEEP_MAX": 0.16,
-    "LIMIT": 2
+    # NOTE: LIMIT intentionally NOT in defaults — must come from config/config.json
+    "SHORT_TIMEOUT_MIN": 60,
+    "SHORT_TIMEOUT_MAX": 180,
+    "LONG_TIMEOUT_MIN": 300,
+    "LONG_TIMEOUT_MAX": 660,
 }
 
 def log(msg: str, **kv):
@@ -69,9 +72,11 @@ def build_search_url(base_url: str, job: str, location: str) -> str:
 def preload_seen_urls() -> Set[str]:
     seen: Set[str] = set()
     for row in read_jsonl(LINKS_JSONL):
-        u = row.get("url")
-        if isinstance(u,str) and u.strip():
-            seen.add(u.strip())
+        # tolerate dirty lines
+        if isinstance(row, dict):
+            u = row.get("url")
+            if isinstance(u, str) and u.strip():
+                seen.add(u.strip())
     return seen
 
 async def async_handle_error(page: Optional[Page], prefix: str, step_info: str, fail_fast: bool):
@@ -166,22 +171,30 @@ async def _scan_and_save(page: Page, seen_global: Set[str], job: str, loc: str, 
     return added_count
 
 async def collect_incremental(page: Page, cfg: dict, job: str, loc: str, seen_global: Set[str]) -> Tuple[int, bool]:
+    # LIMIT comes strictly from user config; if missing or 0 => unlimited
     limit = int(cfg.get("LIMIT", 0) or 0)
+
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
     except:
         pass
+
     if not await _hover_first(page):
         log("Process started, but no anchors found")
         return 0, False
+
     results_in_run: List[Tuple[str,str]] = []
     start = time.monotonic()
-    log("Process started to find jobs...")
+    log("Process started to find jobs...", job=job, location=loc, limit=limit)
+
     total_new = await _scan_and_save(page, seen_global, job, loc, results_in_run)
-    limit_hit = (limit > 0 and total_new >= limit)
+
+    # limit_hit is only True when strictly more than LIMIT were collected
+    limit_hit = (limit > 0 and total_new > limit)
     if limit_hit:
-        log("Finished", total=total_new)
+        log("Finished (limit_hit)", total=total_new)
         return total_new, True
+
     bottom_reached = False
     while True:
         if time.monotonic() - start > cfg["MAX_LOOP_SECONDS"]:
@@ -195,13 +208,18 @@ async def collect_incremental(page: Page, cfg: dict, job: str, loc: str, seen_gl
             await _press_down(page)
         await asyncio.sleep(random.uniform(cfg["SLEEP_MIN"], cfg["SLEEP_MAX"]))
         total_new += await _scan_and_save(page, seen_global, job, loc, results_in_run)
-        if limit > 0 and total_new >= limit:
+
+        # again, strictly > LIMIT to count as "limit_hit"
+        if limit > 0 and total_new > limit:
             limit_hit = True
             break
+
         if TARGET_STOP_VALUE and any(di == str(TARGET_STOP_VALUE) for di, _ in results_in_run):
             break
+
     if bottom_reached:
         log("Scrolled down")
+
     log("Finished", total=total_new)
     return total_new, limit_hit
 
@@ -217,9 +235,11 @@ async def collect_for(job: str, loc: str, cfg: dict) -> bool:
             url = build_search_url(base, job, loc)
             log("Opening search", url=url)
             await page.goto(url, wait_until="domcontentloaded")
+
             seen_global = preload_seen_urls()
             added, limit_hit = await collect_incremental(page, cfg, job, loc, seen_global)
-            log("Done", added=added, total=len(seen_global))
+            log("Done", added=added, total=len(seen_global), limit_hit=limit_hit)
+
             with contextlib.suppress(Exception):
                 await ctx.storage_state(path=str(STORAGE_STATE_JSON))
             return limit_hit
@@ -234,16 +254,28 @@ async def main_async():
     global TARGET_STOP_VALUE
     if cfg.get("TARGET_INDEXES"):
         TARGET_STOP_VALUE = str(cfg["TARGET_INDEXES"])
+
+    # timeouts (seconds)
+    short_min = int(cfg.get("SHORT_TIMEOUT_MIN", 60))
+    short_max = int(cfg.get("SHORT_TIMEOUT_MAX", 180))
+    long_min  = int(cfg.get("LONG_TIMEOUT_MIN", 300))
+    long_max  = int(cfg.get("LONG_TIMEOUT_MAX", 660))
+
+    # just to make it explicit in logs which LIMIT is active
+    active_limit = int(cfg.get("LIMIT", 0) or 0)
+    log("Config loaded", limit=active_limit, short=f"{short_min}-{short_max}s", long=f"{long_min}-{long_max}s")
+
     Path(LINKS_JSONL).parent.mkdir(parents=True, exist_ok=True)
     Path(LINKS_JSONL).touch(exist_ok=True)
+
     for loc in cfg["LOCATIONS"]:
         for job in cfg["JOB_NAMES"]:
             limit_hit = await collect_for(job, loc, cfg)
             if limit_hit:
-                wait = random.randint(11*60, 21*60)
+                wait = random.randint(long_min, long_max)
             else:
-                wait = random.randint(300, 660)
-            log("Waiting for next run", minutes=round(wait/60, 1))
+                wait = random.randint(short_min, short_max)
+            log("Waiting for next run", minutes=round(wait / 60, 1), limit_hit=limit_hit)
             await asyncio.sleep(wait)
 
 if __name__ == "__main__":
