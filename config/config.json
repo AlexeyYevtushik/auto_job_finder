@@ -1,9 +1,14 @@
 {
   "JOB_NAMES": ["QA Automation"],
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
-  "INTRODUCE_YOURSELF": "Github: _your_link_to_github_\nLinkedIn: _your_link_to_linkedin_",
+  "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
   
-  "LOCATIONS": ["remote", "poland-remote", "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana", "lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw", "remote", "kyiv", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "rzeszow",  "bydgoszcz", "czestochowa", "olsztyn", "nowy-sacz", "torun", "kalisz", "tarnow", "opole", "koszalin", "plock", "stalowa-wola", "przemysl", "slupsk", "mielec", "konin", "wloclawek", "krosno", "gniezno", "walbrzych", "stargard", "kwidzyn", "zamosc", "elblag"], 
+  "LOCATIONS": [ "remote"], 
+  "SHORT_TIMEOUT_MIN": 0,
+  "SHORT_TIMEOUT_MAX": 10,
+  "LONG_TIMEOUT_MIN": 60,
+  "LONG_TIMEOUT_MAX": 360,
+  
   "REQUIRE_CONFIRMATION": true,
   "HEADFUL": true,
   "TARGET_INDEXES": 1000,
@@ -12,12 +17,12 @@
   "ALLOW_COOKIE_CLICK": true,
   "ALLOW_SAMEPAGE_OPENER": false,
   "PIPELINE": {
-    "SEQ": "s1,s2x2,s3,s4,s6",
+    "SEQ": "s1,s2x2,s3,s4,s5,s6",
     "SLEEP_SECONDS": 60,
     "KEEP_GOING": false,
     "FORCE_S1": false
   },
 
   
-  "TESTED_LOCATIONS": [ "kielce", "krakow", "radom", "warszawa", "siedlce", "lublana", "lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw", "remote", "kyiv", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "rzeszow",  "bydgoszcz", "czestochowa", "olsztyn", "nowy-sacz", "torun", "kalisz", "tarnow", "opole", "koszalin", "plock", "stalowa-wola", "przemysl", "slupsk", "mielec", "konin", "wloclawek", "krosno", "gniezno", "walbrzych", "stargard", "kwidzyn", "zamosc", "elblag"]
+  "TESTED_LOCATIONS": [ "remote", "warszawa", "siedlce", "lublana", "lodz", "gliwice" , "rybnik", "katowice", "gdansk", "madrid", "lisbona", "wroclaw", "kyiv", "riga", "vilnius", "kaunas", "budapest", "sofia", "belgrad", "bucharest", "szczecin", "zielona-gora", "poznan", "rzeszow",  "bydgoszcz", "czestochowa", "olsztyn", "nowy-sacz", "torun", "kalisz", "tarnow", "opole", "koszalin", "plock", "stalowa-wola", "przemysl", "slupsk", "mielec", "konin", "wloclawek", "krosno", "gniezno", "walbrzych", "stargard", "kwidzyn", "zamosc", "elblag", "poland-remote", "kielce", "krakow", "radom"]
 }

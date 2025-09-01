@@ -36,15 +36,37 @@ def load_config() -> Dict[str, Any]:
             "ALLOW_COOKIE_CLICK": True,
             "ALLOW_SAMEPAGE_OPENER": False,
             "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
+            # дефолты таймаутов на случай отсутствия файла
+            "SHORT_TIMEOUT_MIN": 160,
+            "SHORT_TIMEOUT_MAX": 320,
+            "LONG_TIMEOUT_MIN": 600,
+            "LONG_TIMEOUT_MAX": 1260,
         }
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Перезаписывает JSONL только словарями, игнорируя None/не-словари."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            if isinstance(r, dict):
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def _coerce_row(obj: Any) -> Optional[Dict[str, Any]]:
+    """Аккуратно приводит строку/объект к dict; иначе возвращает None."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, str):
+        s = obj.strip()
+        if not s:
+            return None
+        try:
+            data = json.loads(s)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
 
 def match_row(r: Dict[str, Any], key_id, val_id, key_url, val_url) -> bool:
     has_id = key_id in r and val_id is not None
@@ -58,20 +80,33 @@ def match_row(r: Dict[str, Any], key_id, val_id, key_url, val_url) -> bool:
     return False
 
 def update_row_inplace(match_id_key: str, match_id_val, match_url_key: str, match_url_val, patch: Dict[str, Any]) -> bool:
-    rows = list(read_jsonl(INPUT_JSONL))
+    # Грузим все валидные dict-записи из файла
+    all_objs = list(read_jsonl(INPUT_JSONL))
+    rows = [r for r in (_coerce_row(x) for x in all_objs) if r is not None]
+
     updated = False
     for r in rows:
         if match_row(r, match_id_key, match_id_val, match_url_key, match_url_val):
             r.update(patch)
             updated = True
             break
+
     if updated:
         write_jsonl(INPUT_JSONL, rows)
     return updated
 
 def get_pending_rows(limit: int) -> List[Dict[str, Any]]:
-    all_rows = list(read_jsonl(INPUT_JSONL))
-    pending = [r for r in all_rows if r.get("easy_apply") is True and r.get("processed") is False]
+    # Берём только корректные dict-записи
+    all_rows = [r for r in (_coerce_row(x) for x in read_jsonl(INPUT_JSONL)) if r is not None]
+
+    # easy_apply == True и processed == False (если processed отсутствует — считаем False)
+    pending: List[Dict[str, Any]] = []
+    for r in all_rows:
+        easy = (r.get("easy_apply") is True)
+        processed = (r.get("processed") is True)
+        if easy and not processed:
+            pending.append(r)
+
     if limit and limit > 0:
         return pending[:limit]
     return pending
@@ -634,7 +669,7 @@ async def audit_form_completeness(scope: Union[Page, Frame]) -> Dict[str, Any]:
           const wrap = el.closest('label');
           if (wrap) labelText = wrap.textContent || '';
         }
-        const likely = /(\\*|required|wymagane|obowiązkowe)/i.test(labelText || '');
+        const likely = /(\*|required|wymagane|obowiązkowe)/i.test(labelText || '');
         return !!(attr || likely);
       };
       const result = {ok: true, required_total: 0, missing: [], scope: sel, _radioGroups: {}};
@@ -648,7 +683,7 @@ async def audit_form_completeness(scope: Union[Page, Frame]) -> Dict[str, Any]:
         if (type === 'hidden') continue;
         if (tag === 'select') {
           const val = (el.value || '').trim();
-          const text = el.options && el.selectedIndex >= 0 ? (el.options[el.selectedIndex].text || '') : '';
+          const text = el.options and el.selectedIndex >= 0 ? (el.options[el.selectedIndex].text || '') : '';
           const badText = /^(select|choose|wybierz|--|)$/i.test((text || '').trim());
           if (!val || badText) result.missing.push({type:'select', name, reason:'empty'});
           continue;
@@ -858,6 +893,7 @@ async def process_one(
         await base_page.goto(url, wait_until="domcontentloaded", timeout=30000)
         with suppress(Exception):
             await base_page.wait_for_load_state("networkidle", timeout=8000)
+
         step("FORM", "open: start")
         form_open, active_scope = await open_application_form(
             base_page,
@@ -867,9 +903,11 @@ async def process_one(
         log_row["s4_form_found"] = form_open
         if not form_open or not active_scope:
             raise RuntimeError("Could not open a TRUE application form (opener not clicked or form not shown)")
+
         step("FILL", "introduce-yourself: start")
         log_row["s4_introduce_filled"] = await fill_introduce_yourself(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'OK' if log_row['s4_introduce_filled'] else 'not found'}")
+
         step("FILL", "introduce-yourself: verify")
         log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         if not log_row["s4_intro_verified"] and log_row["s4_introduce_filled"]:
@@ -878,12 +916,15 @@ async def process_one(
                 await fill_introduce_yourself(active_scope, intro_text)
             log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'VERIFIED' if log_row['s4_intro_verified'] else 'NOT VERIFIED'}")
+
         step("FILL", "positive-selects: start")
         log_row["s4_selects_set"] = await set_positive_selects_if_present(active_scope)
         step("FILL", f"positive-selects: set={log_row['s4_selects_set']}")
+
         step("FILL", "consents: start")
         log_row["s4_consents_ticked"] = await tick_consents_if_present(active_scope)
         step("FILL", f"consents: ticked={log_row['s4_consents_ticked']}")
+
         if log_row["s4_intro_verified"]:
             step("SUBMIT", "try submit immediately")
             quick_clicked = await click_final_apply_in_form(active_scope)
@@ -893,41 +934,50 @@ async def process_one(
                 step("CONFIRM", "wait: start")
                 log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
                 step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
+
         if not log_row["s4_submit_clicked"] and not log_row["s4_confirmation"]:
             step("SUBMIT", "readiness check: start")
             ready, ready_report = await is_form_ready_to_submit(active_scope)
             log_row["s4_form_ready"] = ready
             log_row["s4_form_ready_missing"] = ready_report.get("missing", [])
             log_row["s4_form_required_total"] = ready_report.get("required_total", 0)
+
             if not ready and any(m.get("reason") == "scope_not_found" for m in log_row["s4_form_ready_missing"]):
                 step("SUBMIT", "form scope not found -> check confirmation immediately")
                 if await detect_confirmation_anywhere(active_scope):
                     log_row["s4_confirmation"] = True
                 else:
                     log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
+
             step("SUBMIT", f"readiness: {'READY' if ready else 'NOT READY'}; required_total={log_row['s4_form_required_total']}; missing={log_row['s4_form_ready_missing']}")
+
             if not log_row["s4_confirmation"]:
                 if ready and log_row["s4_intro_verified"]:
                     step("SUBMIT", "click final submit: start")
-                    log_row["s4_submit_clicked"], _ = await click_final_apply_if_ready(active_scope)
+                    clicked, _ = await click_final_apply_if_ready(active_scope)
+                    log_row["s4_submit_clicked"] = clicked
                     step("SUBMIT", f"click final submit: {'OK' if log_row['s4_submit_clicked'] else 'NOT CLICKED'}")
                 else:
                     if not log_row["s4_intro_verified"]:
                         step("SUBMIT", "blocked: intro not verified -> skip submit")
                     elif not ready:
                         step("SUBMIT", "blocked: form not ready -> skip submit")
+
                 if not log_row["s4_confirmation"]:
                     step("CONFIRM", "wait: start")
                     log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
                     step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
+
         if log_row["s4_confirmation"]:
             step("ROW", f"Application Completed -> {rid}")
+
         patch = {**log_row}
         if log_row["s4_confirmation"]:
             patch["processed"] = True
         updated = update_row_inplace(id_key, id_val, url_key, url_val, patch)
         if not updated:
             step("WARN", "row patch did not match any record (check id/url).")
+
     except Exception as e:
         log_row["s4_error"] = f"{type(e).__name__}: {e}"
         step("ERROR", log_row["s4_error"])
@@ -963,9 +1013,19 @@ async def run():
     intro_text = str(cfg.get("INTRODUCE_YOURSELF", "")).strip()
     allow_cookie_click = bool(cfg.get("ALLOW_COOKIE_CLICK", True))
     allow_samepage_opener = bool(cfg.get("ALLOW_SAMEPAGE_OPENER", False))
+
+    # --- читаем таймауты из config + дефолты ---
+    global SHORT_TIMEOUT_MIN, SHORT_TIMEOUT_MAX, LONG_TIMEOUT_MIN, LONG_TIMEOUT_MAX
+    SHORT_TIMEOUT_MIN = int(cfg.get("SHORT_TIMEOUT_MIN", 160))
+    SHORT_TIMEOUT_MAX = int(cfg.get("SHORT_TIMEOUT_MAX", 320))
+    LONG_TIMEOUT_MIN  = int(cfg.get("LONG_TIMEOUT_MIN", 600))
+    LONG_TIMEOUT_MAX  = int(cfg.get("LONG_TIMEOUT_MAX", 1260))
+    # -------------------------------------------
+
     INPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
     INPUT_JSONL.touch(exist_ok=True)
     storage_state = str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None
+
     async with async_playwright() as p:
         browser: Browser = await p.chromium.launch(
             headless=not headful,
@@ -976,6 +1036,7 @@ async def run():
             ctx_kwargs["storage_state"] = storage_state
         ctx: BrowserContext = await browser.new_context(**ctx_kwargs)
         ctx.set_default_timeout(15000)
+
         batch_no = 0
         while True:
             pending = get_pending_rows(limit)
@@ -983,6 +1044,7 @@ async def run():
             if not pending:
                 step("RUN", "no pending rows (easy_apply=true & processed=false) -> done")
                 break
+
             batch_no += 1
             step("RUN", f"batch #{batch_no}: to process now = {len(pending)} (total pending = {total_left})")
             for idx, row in enumerate(pending, 1):
@@ -995,12 +1057,15 @@ async def run():
                     allow_cookie_click=allow_cookie_click,
                     allow_samepage_opener=allow_samepage_opener,
                 )
-                human_sleep(160, 320)
+                await asyncio.sleep(random.uniform(SHORT_TIMEOUT_MIN, SHORT_TIMEOUT_MAX))
+
             if limit <= 0:
                 step("RUN", "LIMIT<=0 -> processed all once, exiting")
                 break
-            step("RUN", "batch pause: 10–21 minutes (await asyncio.sleep)")
-            await asyncio.sleep(random.uniform(600, 1260))
+
+            step("RUN", f"batch pause: ~{int(LONG_TIMEOUT_MIN//60)}–{int(LONG_TIMEOUT_MAX//60)} minutes (await asyncio.sleep)")
+            await asyncio.sleep(random.uniform(LONG_TIMEOUT_MIN, LONG_TIMEOUT_MAX))
+
         await ctx.close()
         await browser.close()
     step("RUN", "done")
