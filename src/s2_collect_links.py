@@ -72,7 +72,6 @@ def build_search_url(base_url: str, job: str, location: str) -> str:
 def preload_seen_urls() -> Set[str]:
     seen: Set[str] = set()
     for row in read_jsonl(LINKS_JSONL):
-        # tolerate dirty lines
         if isinstance(row, dict):
             u = row.get("url")
             if isinstance(u, str) and u.strip():
@@ -143,7 +142,8 @@ def _save_new_if_needed(di: str, url: str, seen_global: Set[str], job: str, loc:
         "new_href": True
     })
     seen_global.add(url)
-    log("Collected new", url=url)
+    # Requested log format:
+    print(f"[S2] Collected new link: {url}", flush=True)
     return True
 
 async def _scan_and_save(page: Page, seen_global: Set[str], job: str, loc: str, results_in_run: List[Tuple[str,str]]) -> int:
