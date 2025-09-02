@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
 # Purpose: Filter job descriptions and detect easy apply (S3 async worker).
 # Steps:
-# 1) Load config and keywords. 2) Read new_href=true links. 3) Open each URL, extract JD, match keywords.
-# 4) Press Apply: if JJ/in-page modal -> easy_apply=True; if new tab/same-tab nav -> final_url set to destination, easy_apply=False; if no Apply -> mark outdated.
-# 5) Save to filtered_links.jsonl, mark link consumed, throttle between items and batches.
+# 1) Load config & keywords; read new_href=true links. 2) Open URL, extract JD, match keywords.
+# 3) Click Apply: if JJ/in-page modal → easy_apply=True; if popup/nav → final_url to destination, easy_apply=False; if no Apply → outdated.
+# 4) Clean description_sample to visible rows (from "All offers" up to before "Apply") and pretty-write each JSON record (multi-line) to filtered_links.jsonl.
+# 5) Mark link consumed, throttle between items/batches.
 # ---------------------------------------------------------------------------
 
 import asyncio
@@ -21,7 +22,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from .common import (
     DATA_DIR, ERRORS_DIR, SCREENSHOTS_DIR,
     LINKS_JSONL, FILTERED_JSONL, STORAGE_STATE_JSON,
-    read_jsonl, append_jsonl,
+    read_jsonl, append_jsonl,  # keep import; we override with our pretty writer below
     now_iso, human_sleep
 )
 
@@ -48,6 +49,13 @@ def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
 
 def _log(msg: str) -> None:
     print(f"[S3] {msg}", flush=True)
+
+def append_pretty_jsonl(path: Union[str, Path], obj: Dict[str, Any]) -> None:
+    """Pretty-print each JSON object (multi-line) to .jsonl."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=1) + "\n")
 
 async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: int = 120, pause_s: float = 3.6):
     for _ in range(max_steps):
@@ -254,6 +262,43 @@ async def _extract_probable_href(page: Page, loc) -> Optional[str]:
                 return href
     return None
 
+# ---- description_sample cleaning helpers (for pretty, visible rows) ----
+
+import re as _re
+
+def _strip_invisibles(text: str) -> str:
+    if not text:
+        return ""
+    return _re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+
+def _slice_between_markers(lines: List[str]) -> List[str]:
+    """
+    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
+    Case-insensitive. If 'All offers' missing -> return original. If 'Apply' missing -> keep to end.
+    """
+    norm = [ln.strip() for ln in lines]
+    try:
+        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
+    except StopIteration:
+        return lines
+    end = None
+    for j in range(start + 1, len(norm)):
+        if norm[j].lower() == "apply":
+            end = j
+            break
+    return lines[start:end] if end is not None else lines[start:]
+
+def to_visible_rows(text: str) -> List[str]:
+    if not text:
+        return []
+    t = _strip_invisibles(text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    lines = _slice_between_markers(lines)
+    lines = [ln.strip() for ln in lines if ln.strip()]
+    return lines
+
+# ------------------------------------------------------------------------
+
 async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[str], headful: bool, fail_fast: bool) -> bool:
     page: Optional[Page] = None
     url = row.get("url")
@@ -267,7 +312,12 @@ async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[s
             await page.wait_for_load_state("networkidle", timeout=8000)
         await slow_scroll_page_to_bottom(page)
         desc_full = await get_job_description_text(page)
+
+        # CLEAN description into visible rows:
+        desc_rows = to_visible_rows(desc_full)
+
         keyword_exists, matched = find_keywords(desc_full, keywords)
+
         result = {
             "id": row.get("id"),
             "data_index": row.get("data_index"),
@@ -276,13 +326,14 @@ async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[s
             "keyword_exists": keyword_exists,
             "matched_keywords": matched,
             "easy_apply": False,
-            "description_sample": desc_full,
+            "description_sample": desc_rows,  # store as list of visible rows
             "processed_at": now_iso(),
             "processed": False,
         }
+
         if not keyword_exists:
             result["processed"] = True
-            append_jsonl(FILTERED_JSONL, result)
+            append_pretty_jsonl(FILTERED_JSONL, result)
             _log("Processed")
             with suppress(Exception): await page.close()
             return True
@@ -295,11 +346,11 @@ async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[s
             result["outdated"]  = True
             result["processed"] = True
             _log("Processed")
-            append_jsonl(FILTERED_JSONL, result)
+            append_pretty_jsonl(FILTERED_JSONL, result)
             with suppress(Exception): await page.close()
             return True
 
-        append_jsonl(FILTERED_JSONL, result)
+        append_pretty_jsonl(FILTERED_JSONL, result)
         _log("Processed")
 
         for p in list(ctx.pages):
@@ -401,7 +452,7 @@ async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, A
                 final_url = new_page.url or (pre_href or "")
                 if not final_url:
                     final_url = page.url or ""
-                # New tab/opened popup is never "easy apply" per requirement
+                # popup/new tab → easy_apply = False
                 return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "popup"}
 
             if (page.url or "") != (orig_url or ""):
@@ -410,19 +461,18 @@ async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, A
                 with suppress(Exception):
                     await page.wait_for_load_state("networkidle", timeout=6000)
                 final_url = page.url or ""
-                # Same-tab navigation is not considered easy apply now
+                # same-tab navigation → easy_apply = False
                 return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "nav"}
 
             await asyncio.sleep(0.2)
 
-        # Fallback to pre-click href if nothing else happened
+        # timeout
         final_url = pre_href or (page.url or "")
         return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "timeout"}
     except Exception:
         final_url = pre_href or (page.url or "")
         return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "error"}
     finally:
-        # close any extra pages created silently
         extras = [p for p in ctx.pages if p not in pages_before and p is not page]
         for p in extras:
             with suppress(Exception):
