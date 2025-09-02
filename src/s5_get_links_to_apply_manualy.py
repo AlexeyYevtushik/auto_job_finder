@@ -1,19 +1,37 @@
-# src/s7_collect_manual_work.py
-# Build data/manual_work.jsonl from filtered_links.jsonl:
-# take processed==false and keep only id, final_url, processed, description_sample
-# where description_sample is cleaned to:
-# - keep content starting from the first "All offers" line (remove everything before it)
-# - stop BEFORE the next "Apply" line (remove that "Apply" line and everything after it)
-# - drop empty rows and invisible chars
+# src/s5_get_links_to_apply_manualy.py
+# Build data/manual_work.jsonl from data/filtered_links.jsonl
+# - take records with processed == false
+# - keep only: id, final_url (fallback: url), processed:false, description_sample (cleaned)
+# Cleaning rules for description_sample:
+#   * accepts str | list[str] | None
+#   * removes zero-width/invisible chars and empty lines
+#   * normalizes newlines
+#   * optionally slices from the first 'All offers'/'Wszystkie oferty' (inclusive)
+#     up to BEFORE the next 'Apply'/'Aplikuj' (exclusive)
+#
+# Run:
+#   python -m src.s5_get_links_to_apply_manualy
 
 from pathlib import Path
 import json, sys, re
+from typing import Dict, Any, Iterable, List, Optional
 
 IN = Path("data/filtered_links.jsonl")
 OUT = Path("data/manual_work.jsonl")
 
-def iter_json_objects(p: Path):
-    dec, buf, depth, in_str, esc = json.JSONDecoder(), [], 0, False, False
+
+def iter_json_objects(p: Path) -> Iterable[Dict[str, Any]]:
+    """
+    Robustly stream JSON objects from a file where objects may be:
+    - one per line (classic .jsonl), or
+    - pretty-printed across multiple lines, back-to-back.
+    """
+    dec = json.JSONDecoder()
+    buf: List[str] = []
+    depth = 0
+    in_str = False
+    esc = False
+
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             for ch in line:
@@ -32,15 +50,27 @@ def iter_json_objects(p: Path):
                         depth += 1
                     elif ch == "}":
                         depth -= 1
+
                 if depth == 0 and buf and any(c.strip() for c in buf):
                     s = "".join(buf).strip()
-                    if s:
+                    if not s:
+                        buf = []
+                        continue
+                    try:
                         obj, idx = dec.raw_decode(s)
-                        yield obj
-                        rest = s[idx:].lstrip()
-                        buf = [*rest] if rest else []
+                    except Exception:
+                        # keep accumulating if not decodable yet
+                        continue
+                    yield obj
+                    rest = s[idx:].lstrip()
+                    buf = list(rest) if rest else []
+
+        # trailing remainder
         if any(c.strip() for c in buf):
-            yield dec.raw_decode("".join(buf).strip())[0]
+            s = "".join(buf).strip()
+            obj, _ = dec.raw_decode(s)
+            yield obj
+
 
 def _strip_invisibles(text: str) -> str:
     if not text:
@@ -48,52 +78,61 @@ def _strip_invisibles(text: str) -> str:
     # remove zero-width/invisible characters
     return re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
 
-def _slice_between_markers(lines):
+
+def _slice_between_markers(lines: List[str]) -> List[str]:
     """
-    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
-    If 'All offers' missing -> return original lines.
-    If 'Apply' after it missing -> keep until end.
-    Comparisons are case-insensitive and trimmed.
+    Keep from the FIRST 'All offers'/'Wszystkie oferty' (inclusive)
+    to BEFORE the FIRST 'Apply'/'Aplikuj' after it (exclusive).
+    If start marker missing -> return the original lines.
+    If end marker missing -> keep until the end.
     """
-    norm = [ln.strip() for ln in lines]
-    # find first "All offers"
-    try:
-        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
-    except StopIteration:
-        return lines  # no slice if marker not found
+    start_markers = {"all offers", "wszystkie oferty"}
+    end_markers = {"apply", "aplikuj"}
 
-    # find next "Apply" after start
-    end = None
-    for j in range(start + 1, len(norm)):
-        if norm[j].lower() == "apply":
-            end = j
-            break
+    norm = [ln.strip().lower() for ln in lines]
+    start: Optional[int] = next((i for i, ln in enumerate(norm) if ln in start_markers), None)
+    if start is None:
+        return lines
 
-    if end is None:
-        sliced = lines[start:]
-    else:
-        sliced = lines[start:end]  # exclude the 'Apply' row itself
+    end: Optional[int] = next(
+        (j for j, ln in enumerate(norm[start + 1 :], start + 1) if ln in end_markers),
+        None,
+    )
+    return lines[start:] if end is None else lines[start:end]
 
-    return sliced
 
-def to_visible_rows(text: str):
-    if not text:
+def to_visible_rows(text_or_lines) -> List[str]:
+    """
+    Accepts str | list[str] | None.
+    Returns a cleaned list[str].
+    """
+    if not text_or_lines:
         return []
-    t = _strip_invisibles(text)
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln.rstrip() for ln in t.split("\n")]
 
-    # slice between 'All offers' … 'Apply'
+    lines: List[str] = []
+
+    if isinstance(text_or_lines, list):
+        for item in text_or_lines:
+            if item is None:
+                continue
+            s = _strip_invisibles(str(item))
+            s = s.replace("\r\n", "\n").replace("\r", "\n")
+            lines.extend([ln.rstrip() for ln in s.split("\n")])
+    else:
+        s = _strip_invisibles(str(text_or_lines))
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [ln.rstrip() for ln in s.split("\n")]
+
+    # optional slice between markers
     lines = _slice_between_markers(lines)
 
-    # drop empty rows
-    lines = [ln.strip() for ln in lines if ln.strip()]
+    # drop empty lines
+    return [ln.strip() for ln in lines if ln.strip()]
 
-    return lines
 
 def main():
     if not IN.exists():
-        print(f"[S7] Missing {IN}", file=sys.stderr)
+        print(f"[S5] Missing {IN}", file=sys.stderr)
         sys.exit(1)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -107,14 +146,13 @@ def main():
                     "final_url": obj.get("final_url") or obj.get("url"),
                     "processed": False,
                 }
-                # new line before new parameter; description_sample cleaned and sliced
+                # normalize description_sample (str | list[str] -> list[str])
                 rec["description_sample"] = to_visible_rows(obj.get("description_sample"))
-
-                # Pretty JSON so each field starts on a new line
                 out.write(json.dumps(rec, ensure_ascii=False, indent=1) + "\n")
                 cnt += 1
 
-    print(f"[S7] Wrote {cnt} records → {OUT}")
+    print(f"[S5] Wrote {cnt} records → {OUT}")
+
 
 if __name__ == "__main__":
     main()
