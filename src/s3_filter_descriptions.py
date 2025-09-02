@@ -1,11 +1,19 @@
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Purpose: Filter job descriptions and detect easy apply (S3 async worker).
-# Steps:
-# 1) Load config & keywords; read new_href=true links. 2) Open URL, extract JD, match keywords.
-# 3) Click Apply: if JJ/in-page modal → easy_apply=True; if popup/nav → final_url to destination, easy_apply=False; if no Apply → outdated.
-# 4) Clean description_sample to visible rows (from "All offers" up to before "Apply") and pretty-write each JSON record (multi-line) to filtered_links.jsonl.
-# 5) Mark link consumed, throttle between items/batches.
-# ---------------------------------------------------------------------------
+# Behavior:
+# - Reads new_href=true links, visits pages, extracts/cleans description,
+#   finds keywords, detects Apply flow (modal vs popup/navigation).
+# - Writes results into filtered_links.jsonl in pretty multi-line JSON format.
+# - IMPORTANT: Uses "upsert" semantics:
+#     * If record with same id (and optional same final_url) exists -> update ONLY values
+#       (shallow merge), keep object (conceptually) the same.
+#     * If not found -> append as a new pretty JSON object.
+# - File I/O details:
+#     * JSONL is multi-line per object; we stream objects safely,
+#       rewrite to a temp file for updates, then atomically replace.
+#     * Each object and each field is written on its own line (indent=1).
+# -----------------------------------------------------------------------------
+
 
 import asyncio
 import json
@@ -13,24 +21,131 @@ import os
 import re
 import random
 import traceback
+import tempfile
+import shutil
 from contextlib import suppress
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Union, Optional
+
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+
 from .common import (
     DATA_DIR, ERRORS_DIR, SCREENSHOTS_DIR,
     LINKS_JSONL, FILTERED_JSONL, STORAGE_STATE_JSON,
-    read_jsonl, append_jsonl,  # keep import; we override with our pretty writer below
+    read_jsonl, append_jsonl,  # kept import; we override with pretty/upsert below
     now_iso, human_sleep
 )
 
 DEFAULT_KEYWORDS = ["python", "playwright", "javascript", "typescript"]
 
+
+# ------------------------------- Logging -------------------------------------
+
+
+def _log(msg: str) -> None:
+    print(f"[S3] {msg}", flush=True)
+
+
+def safe_filename(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)
+
+
+# ---------------------- Pretty JSONL write + UPSERT --------------------------
+# Rationale:
+# - We must not "recreate" objects semantically: only update field values or add new fields.
+# - JSONL has one (multi-line) JSON object per logical row.
+# - To update an existing object, we stream-read objects, shallow-merge updates into the
+#   matched object, write all objects into a temporary file, then atomically replace source.
+# - For append, we simply append a pretty JSON object.
+
+
+def _iter_multiline_jsonl(p: Path):
+    """Yield JSON objects from a JSONL file where each object is multi-line pretty JSON."""
+    if not p.exists():
+        return
+    decoder = json.JSONDecoder()
+    buf = ""
+    with p.open("r", encoding="utf-8", newline="\n") as f:
+        for line in f:
+            buf += line
+            try:
+                # Try to decode from the first non-space
+                lead = len(buf) - len(buf.lstrip())
+                obj, idx = decoder.raw_decode(buf.lstrip())
+                # Leftover (if any) stays in buffer
+                buf = buf[lead + idx:]
+                yield obj
+            except json.JSONDecodeError:
+                # Not a full JSON yet; keep accumulating lines
+                continue
+    # If buf has only whitespace, it's fine; otherwise it's a trailing error.
+    if buf.strip():
+        raise ValueError("Trailing non-JSON content at the end of file.")
+
+
+def _write_pretty_jsonl_row(fh, obj: Dict[str, Any]) -> None:
+    """Pretty-print one JSON object with indent=1 and a trailing newline."""
+    fh.write(json.dumps(obj, ensure_ascii=False, indent=1) + "\n")
+
+
+def _shallow_merge(obj: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Shallow merge: update/add only top-level keys (no deep merge)."""
+    for k, v in patch.items():
+        obj[k] = v
+    return obj
+
+
+def _upsert_filtered_record(record: Dict[str, Any], match_by_final_url: bool = False) -> None:
+    """
+    Upsert into FILTERED_JSONL:
+      - If existing object with same 'id' (and optionally same 'final_url') is found:
+          shallow-merge 'record' into it (update values / add keys).
+      - Else: append a new pretty JSON object.
+    Constraints:
+      - Keep multi-line format (indent=1) so each field appears on its own line.
+      - Use atomic replace on update for safety.
+    """
+    path = Path(FILTERED_JSONL)
+    rec_id = str(record.get("id") or "")
+    rec_final_url = str(record.get("final_url") or "")
+
+    if not path.exists():
+        # First write: just append pretty
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
+            _write_pretty_jsonl_row(fh, record)
+        return
+
+    found = False
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        for obj in _iter_multiline_jsonl(path):
+            oid = str(obj.get("id") or "")
+            o_final = str(obj.get("final_url") or "")
+            is_match = (oid == rec_id) and (o_final == rec_final_url if match_by_final_url else True)
+            if is_match and not found:
+                # Update values only; keep the object logically the same
+                obj = _shallow_merge(obj, record)
+                found = True
+            _write_pretty_jsonl_row(tmp, obj)
+
+        if not found:
+            # Append the new record at the end
+            _write_pretty_jsonl_row(tmp, record)
+
+    # Atomic replace
+    shutil.move(str(tmp_path), str(path))
+
+
+# ----------------------------- Keyword helpers -------------------------------
+
+
 def _normalize_keyword_token(tok: str) -> List[str]:
     parts = re.split(r"[,\s/]+", tok)
     return [p.strip().lower() for p in parts if p.strip()]
+
 
 def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
     toks: List[str] = []
@@ -44,18 +159,19 @@ def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
     seen, out = set(), []
     for t in toks:
         if t and t not in seen:
-            seen.add(t); out.append(t)
+            seen.add(t)
+            out.append(t)
     return out or DEFAULT_KEYWORDS[:]
 
-def _log(msg: str) -> None:
-    print(f"[S3] {msg}", flush=True)
 
-def append_pretty_jsonl(path: Union[str, Path], obj: Dict[str, Any]) -> None:
-    """Pretty-print each JSON object (multi-line) to .jsonl."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps(obj, ensure_ascii=False, indent=1) + "\n")
+def find_keywords(text: str, keywords: List[str]) -> Tuple[bool, List[str]]:
+    text_l = text.lower()
+    matched = [kw for kw in keywords if kw in text_l]
+    return (len(matched) > 0, matched)
+
+
+# ------------------------------- Page helpers --------------------------------
+
 
 async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: int = 120, pause_s: float = 3.6):
     for _ in range(max_steps):
@@ -74,6 +190,7 @@ async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: 
             break
         await asyncio.sleep(pause_s)
 
+
 async def get_job_description_text(page: Page) -> str:
     try:
         blocks = page.locator("xpath=//h2/../../")
@@ -84,6 +201,7 @@ async def get_job_description_text(page: Page) -> str:
                 blk = blocks.nth(i)
                 with suppress(Exception):
                     await blk.scroll_into_view_if_needed()
+                # Nudge viewport to ensure content is fully rendered
                 for _ in range(40):
                     try:
                         handle = await blk.element_handle()
@@ -112,6 +230,8 @@ async def get_job_description_text(page: Page) -> str:
                 return texts[0]
     except Exception:
         pass
+
+    # Fallback candidates
     candidates = [
         '[data-testid="job-description"]',
         '[data-test="job-description"]',
@@ -139,6 +259,7 @@ async def get_job_description_text(page: Page) -> str:
                     return texts[0]
         except Exception:
             continue
+
     for sel in ["div[role='main']", "#__next main", "body"]:
         with suppress(Exception):
             t = await page.locator(sel).inner_text(timeout=2000)
@@ -146,12 +267,14 @@ async def get_job_description_text(page: Page) -> str:
                 return t.strip()
     return ""
 
+
 def _is_justjoin(url: str) -> bool:
     try:
         host = (urlparse(url).netloc or "").lower()
         return host.endswith("justjoin.it")
     except Exception:
         return False
+
 
 async def detect_jj_easy_apply_modal(page: Page) -> bool:
     if not _is_justjoin(page.url or ""):
@@ -163,15 +286,16 @@ async def detect_jj_easy_apply_modal(page: Page) -> bool:
         if await dlg.count() == 0:
             return False
         has_heading = await dlg.filter(has_text=re.compile(r"Application form|Formularz aplikacyjny", re.I)).count() > 0
-        has_form  = await dlg.locator("form").count() > 0
+        has_form = await dlg.locator("form").count() > 0
         has_apply = await dlg.locator("button:has-text('Apply'), button:has-text('Aplikuj')").count() > 0
         hint_intro = await dlg.locator("textarea[placeholder*='Introduce yourself' i]").count() > 0
-        hint_name  = await dlg.filter(has_text=re.compile(r"First and last name|Imię i nazwisko", re.I)).count() > 0
-        hint_mail  = await dlg.filter(has_text=re.compile(r"Email", re.I)).count() > 0
+        hint_name = await dlg.filter(has_text=re.compile(r"First and last name|Imię i nazwisko", re.I)).count() > 0
+        hint_mail = await dlg.filter(has_text=re.compile(r"Email", re.I)).count() > 0
         score = sum([has_heading, has_form, has_apply, hint_intro, (hint_name or hint_mail)])
         return has_form and has_apply and score >= 3
     except Exception:
         return False
+
 
 async def detect_easy_apply_modal(page: Page) -> bool:
     try:
@@ -179,13 +303,15 @@ async def detect_easy_apply_modal(page: Page) -> bool:
         if await dlg.count() == 0:
             return False
         dlg = dlg.first
-        has_form   = await dlg.locator("form").count() > 0
+        has_form = await dlg.locator("form").count() > 0
         has_inputs = (await dlg.locator("input[type='email'], input[type='text'], input[type='file'], textarea").count()) > 0
-        has_cv     = (await dlg.locator("input[type='file'], [data-testid*='cv' i], [data-test*='cv' i]").count()) > 0
+        has_cv = (await dlg.locator("input[type='file'], [data-testid*='cv' i], [data-test*='cv' i]").count()) > 0
         text_hits = await dlg.filter(
             has_text=re.compile(
                 r"(apply|send application|submit application|application form|confirm application|"
-                r"aplikuj|wyślij|formularz aplikacyjny|złóż aplikację)", re.I)
+                r"aplikuj|wyślij|formularz aplikacyjny|złóż aplikację)",
+                re.I,
+            )
         ).count() > 0
         has_submit_btn = (
             await dlg.locator(
@@ -198,42 +324,74 @@ async def detect_easy_apply_modal(page: Page) -> bool:
     except Exception:
         return False
 
-def find_keywords(text: str, keywords: List[str]) -> Tuple[bool, List[str]]:
-    text_l = text.lower()
-    matched = [kw for kw in keywords if kw in text_l]
-    return (len(matched) > 0, matched)
 
-def safe_filename(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)
+# ------------------ Description cleaning to visible rows ---------------------
 
-def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-def take_new_links(limit: int) -> List[Dict[str, Any]]:
-    all_rows = list(read_jsonl(LINKS_JSONL))
-    new_rows = [r for r in all_rows if r.get("new_href") is True]
-    if limit and limit > 0:
-        return new_rows[:limit]
-    return new_rows
+import re as _re
 
-def mark_link_consumed(row: Dict[str, Any]) -> None:
-    key = row.get("url") or row.get("id")
-    if not key:
-        return
-    all_rows = list(read_jsonl(LINKS_JSONL))
-    changed = False
-    for r in all_rows:
-        k = r.get("url") or r.get("id")
-        if k == key:
-            if r.get("new_href") is not False:
-                r["new_href"] = False
-                changed = True
+
+def _strip_invisibles(text: str) -> str:
+    if not text:
+        return ""
+    return _re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+
+
+def _slice_between_markers(lines: List[str]) -> List[str]:
+    """
+    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
+    Case-insensitive. If 'All offers' missing -> return original. If 'Apply' missing -> keep to end.
+    """
+    norm = [ln.strip() for ln in lines]
+    try:
+        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
+    except StopIteration:
+        return lines
+    end = None
+    for j in range(start + 1, len(norm)):
+        if norm[j].lower() == "apply":
+            end = j
             break
-    if changed:
-        _write_jsonl(Path(LINKS_JSONL), all_rows)
+    return lines[start:end] if end is not None else lines[start:]
+
+
+def to_visible_rows(text: str) -> List[str]:
+    if not text:
+        return []
+    t = _strip_invisibles(text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    lines = _slice_between_markers(lines)
+    lines = [ln.strip() for ln in lines if ln.strip()]
+    return lines
+
+
+# --------------------------- Apply detection flow ----------------------------
+
+
+async def find_apply_button(page: Page):
+    regexes = [re.compile(pat, re.I) for pat in [
+        r"\bapply now?\b", r"\bapply\b", r"\bsubmit application\b", r"\bsend application\b",
+        r"\baplikuj\b", r"\bwyślij\b"
+    ]]
+    for rx in regexes:
+        for by_role in ("button", "link"):
+            loc = page.get_by_role(by_role, name=rx)
+            if await loc.count() > 0:
+                return loc.first
+    candidates = [
+        "[data-testid*='apply' i]", "[data-test*='apply' i]",
+        "button[type='submit']", "button[name*='apply' i]", "[aria-label*='apply' i]",
+        "a[href*='apply' i]", "button:has-text('Apply')", "a:has-text('Apply')",
+        "button:has-text('Aplikuj')", "a:has-text('Aplikuj')",
+        "button:has-text('Submit')", "button:has-text('Send')",
+        "a:has-text('Submit')", "a:has-text('Send')",
+    ]
+    for sel in candidates:
+        loc = page.locator(sel)
+        if await loc.count() > 0:
+            return loc.first
+    return None
+
 
 async def _extract_probable_href(page: Page, loc) -> Optional[str]:
     with suppress(Exception):
@@ -262,152 +420,6 @@ async def _extract_probable_href(page: Page, loc) -> Optional[str]:
                 return href
     return None
 
-# ---- description_sample cleaning helpers (for pretty, visible rows) ----
-
-import re as _re
-
-def _strip_invisibles(text: str) -> str:
-    if not text:
-        return ""
-    return _re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
-
-def _slice_between_markers(lines: List[str]) -> List[str]:
-    """
-    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
-    Case-insensitive. If 'All offers' missing -> return original. If 'Apply' missing -> keep to end.
-    """
-    norm = [ln.strip() for ln in lines]
-    try:
-        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
-    except StopIteration:
-        return lines
-    end = None
-    for j in range(start + 1, len(norm)):
-        if norm[j].lower() == "apply":
-            end = j
-            break
-    return lines[start:end] if end is not None else lines[start:]
-
-def to_visible_rows(text: str) -> List[str]:
-    if not text:
-        return []
-    t = _strip_invisibles(text).replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln.rstrip() for ln in t.split("\n")]
-    lines = _slice_between_markers(lines)
-    lines = [ln.strip() for ln in lines if ln.strip()]
-    return lines
-
-# ------------------------------------------------------------------------
-
-async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[str], headful: bool, fail_fast: bool) -> bool:
-    page: Optional[Page] = None
-    url = row.get("url")
-    if not url:
-        return False
-    try:
-        _log(f'New link is processing: "{url}"')
-        page = await ctx.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        with suppress(Exception):
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        await slow_scroll_page_to_bottom(page)
-        desc_full = await get_job_description_text(page)
-
-        # CLEAN description into visible rows:
-        desc_rows = to_visible_rows(desc_full)
-
-        keyword_exists, matched = find_keywords(desc_full, keywords)
-
-        result = {
-            "id": row.get("id"),
-            "data_index": row.get("data_index"),
-            "url": url,
-            "final_url": url,
-            "keyword_exists": keyword_exists,
-            "matched_keywords": matched,
-            "easy_apply": False,
-            "description_sample": desc_rows,  # store as list of visible rows
-            "processed_at": now_iso(),
-            "processed": False,
-        }
-
-        if not keyword_exists:
-            result["processed"] = True
-            append_pretty_jsonl(FILTERED_JSONL, result)
-            _log("Processed")
-            with suppress(Exception): await page.close()
-            return True
-
-        info = await click_apply_and_detect(ctx, page)
-        result["easy_apply"] = bool(info["easy_apply"])
-        result["final_url"]  = info["final_url"]
-
-        if not info["apply_found"]:
-            result["outdated"]  = True
-            result["processed"] = True
-            _log("Processed")
-            append_pretty_jsonl(FILTERED_JSONL, result)
-            with suppress(Exception): await page.close()
-            return True
-
-        append_pretty_jsonl(FILTERED_JSONL, result)
-        _log("Processed")
-
-        for p in list(ctx.pages):
-            if p is page:
-                continue
-            with suppress(Exception): await p.close()
-        with suppress(Exception): await page.close()
-        return True
-    except Exception:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ERRORS_DIR.mkdir(parents=True, exist_ok=True)
-        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        png = SCREENSHOTS_DIR / f"s3_{safe_filename(row.get('id') or 'item')}_{ts}.png"
-        txt = ERRORS_DIR / f"s3_{safe_filename(row.get('id') or 'item')}_{ts}.txt"
-        with suppress(Exception):
-            if page: await page.screenshot(path=str(png), full_page=True)
-        with txt.open("w", encoding="utf-8") as f:
-            f.write(f"TIME: {now_iso()}\nURL: {url}\n\nTRACEBACK:\n{traceback.format_exc()}\n")
-        print(f"[ERROR] s3_filter: saved {png.name} and {txt.name}")
-        if fail_fast:
-            raise
-        return False
-    finally:
-        if page and not page.is_closed():
-            with suppress(Exception): await page.close()
-
-async def find_apply_button(page: Page):
-    regexes = [re.compile(pat, re.I) for pat in [
-        r"\bapply now?\b", r"\bapply\b", r"\bsubmit application\b", r"\bsend application\b",
-        r"\baplikuj\b", r"\bwyślij\b"
-    ]]
-    for rx in regexes:
-        for by_role in ("button", "link"):
-            loc = page.get_by_role(by_role, name=rx)
-            if await loc.count() > 0:
-                return loc.first
-    candidates = [
-        "[data-testid*='apply' i]", "[data-test*='apply' i]",
-        "button[type='submit']", "button[name*='apply' i]", "[aria-label*='apply' i]",
-        "a[href*='apply' i]", "button:has-text('Apply')", "a:has-text('Apply')",
-        "button:has-text('Aplikuj')", "a:has-text('Aplikuj')",
-        "button:has-text('Submit')", "button:has-text('Send')",
-        "a:has-text('Submit')", "a:has-text('Send')",
-    ]
-    for sel in candidates:
-        loc = page.locator(sel)
-        if await loc.count() > 0:
-            return loc.first
-    return None
-
-async def _cancel_pending(tasks: List[asyncio.Task]) -> None:
-    if not tasks:
-        return
-    for t in tasks:
-        if not t.done():
-            t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
 
 async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, Any]:
     apply = await find_apply_button(page)
@@ -478,6 +490,45 @@ async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, A
             with suppress(Exception):
                 await p.close()
 
+
+# ----------------------------- Link management -------------------------------
+
+
+def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def take_new_links(limit: int) -> List[Dict[str, Any]]:
+    all_rows = list(read_jsonl(LINKS_JSONL))
+    new_rows = [r for r in all_rows if r.get("new_href") is True]
+    if limit and limit > 0:
+        return new_rows[:limit]
+    return new_rows
+
+
+def mark_link_consumed(row: Dict[str, Any]) -> None:
+    key = row.get("url") or row.get("id")
+    if not key:
+        return
+    all_rows = list(read_jsonl(LINKS_JSONL))
+    changed = False
+    for r in all_rows:
+        k = r.get("url") or r.get("id")
+        if k == key:
+            if r.get("new_href") is not False:
+                r["new_href"] = False
+                changed = True
+            break
+    if changed:
+        _write_jsonl(Path(LINKS_JSONL), all_rows)
+
+
+# ------------------------------ Config loading -------------------------------
+
+
 def _load_config() -> Dict[str, Any]:
     cfg_path = os.environ.get("CONFIG", "config/config.json")
     p = Path(cfg_path)
@@ -491,26 +542,120 @@ def _load_config() -> Dict[str, Any]:
             f"Invalid JSON in {cfg_path} at line {e.lineno}, column {e.colno}: {e.msg}"
         ) from e
 
+
+# --------------------------------- S3 core -----------------------------------
+
+
+async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[str], headful: bool, fail_fast: bool) -> bool:
+    page: Optional[Page] = None
+    url = row.get("url")
+    if not url:
+        return False
+    try:
+        _log(f'New link is processing: "{url}"')
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        with suppress(Exception):
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        await slow_scroll_page_to_bottom(page)
+        desc_full = await get_job_description_text(page)
+
+        # CLEAN description into visible rows:
+        desc_rows = to_visible_rows(desc_full)
+
+        keyword_exists, matched = find_keywords(desc_full, keywords)
+
+        # Prepare result (note: final_url initially equals url)
+        result = {
+            "id": row.get("id"),
+            "data_index": row.get("data_index"),
+            "url": url,
+            "final_url": url,
+            "keyword_exists": keyword_exists,
+            "matched_keywords": matched,
+            "easy_apply": False,
+            "description_sample": desc_rows,  # store as list of visible rows
+            "processed_at": now_iso(),
+            "processed": False,
+        }
+
+        if not keyword_exists:
+            # Mark processed=true on non-matching keywords
+            result["processed"] = True
+            _upsert_filtered_record(result, match_by_final_url=True)
+            _log("Processed (no keywords)")
+            with suppress(Exception):
+                await page.close()
+            return True
+
+        info = await click_apply_and_detect(ctx, page)
+        result["easy_apply"] = bool(info["easy_apply"])
+        result["final_url"] = info["final_url"]
+
+        if not info["apply_found"]:
+            result["outdated"] = True
+            result["processed"] = True
+            _upsert_filtered_record(result, match_by_final_url=False)
+            _log("Processed (apply not found)")
+            with suppress(Exception):
+                await page.close()
+            return True
+
+        # Normal case: upsert collected fields
+        _upsert_filtered_record(result, match_by_final_url=False)
+        _log("Processed")
+
+        # Cleanup extra pages
+        for p in list(ctx.pages):
+            if p is page:
+                continue
+            with suppress(Exception):
+                await p.close()
+        with suppress(Exception):
+            await page.close()
+        return True
+
+    except Exception:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        png = SCREENSHOTS_DIR / f"s3_{safe_filename(row.get('id') or 'item')}_{ts}.png"
+        txt = ERRORS_DIR / f"s3_{safe_filename(row.get('id') or 'item')}_{ts}.txt"
+        with suppress(Exception):
+            if page:
+                await page.screenshot(path=str(png), full_page=True)
+        with txt.open("w", encoding="utf-8") as f:
+            f.write(f"TIME: {now_iso()}\nURL: {url}\n\nTRACEBACK:\n{traceback.format_exc()}\n")
+        print(f"[ERROR] s3_filter: saved {png.name} and {txt.name}")
+        if fail_fast:
+            raise
+        return False
+    finally:
+        if page and not page.is_closed():
+            with suppress(Exception):
+                await page.close()
+
+
 async def run_with_config():
     cfg = _load_config()
-    headful   = bool(cfg.get("HEADFUL", True))
+    headful = bool(cfg.get("HEADFUL", True))
     fail_fast = bool(cfg.get("FAIL_FAST", False))
-    limit     = int(cfg.get("LIMIT", 0))
-    keywords  = normalize_keywords(cfg.get("KEYWORDS"))
+    limit = int(cfg.get("LIMIT", 0))
+    keywords = normalize_keywords(cfg.get("KEYWORDS"))
     storage_state = str(STORAGE_STATE_JSON) if Path(STORAGE_STATE_JSON).exists() else None
 
     short_min = int(cfg.get("SHORT_TIMEOUT_MIN", 60))
     short_max = int(cfg.get("SHORT_TIMEOUT_MAX", 180))
-    long_min  = int(cfg.get("LONG_TIMEOUT_MIN", 300))
-    long_max  = int(cfg.get("LONG_TIMEOUT_MAX", 660))
+    long_min = int(cfg.get("LONG_TIMEOUT_MIN", 300))
+    long_max = int(cfg.get("LONG_TIMEOUT_MAX", 660))
 
     async with async_playwright() as p:
         browser: Browser = await p.chromium.launch(
             headless=not headful,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--disable-popup-blocking"
-            ]
+                "--disable-popup-blocking",
+            ],
         )
         ctx_kwargs = {}
         if storage_state:
@@ -557,8 +702,10 @@ async def run_with_config():
         await ctx.close()
         await browser.close()
 
+
 def main():
     asyncio.run(run_with_config())
+
 
 if __name__ == "__main__":
     main()

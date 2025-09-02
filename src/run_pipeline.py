@@ -15,9 +15,7 @@ CANDIDATES = {
   "s2": ["s2_collect_links"],
   "s3": ["s3_filter_descriptions","s3_scrape_details"],
   "s4": ["s4_easy_apply","s4_enrich_export"],
-  "s5": ["s5_*"],
-  "s6": ["s6_prepare_filtered_jsonl"],
-  "s7": ["s7_collect_manual_work"],
+  "s5": ["s5_get_links_to_apply_manualy"],
 }
 
 def resolve(step: str) -> str:
@@ -43,7 +41,7 @@ def run(mod: str) -> int:
     return subprocess.call([sys.executable,"-m",mod], cwd=str(ROOT))
 
 def load_opts():
-    opts={"SEQ":"s0,s1,s2,s3,s4,s6","SLEEP_SECONDS":0.0,"KEEP_GOING":False,"FORCE_S1":False}
+    opts={"SEQ":"s0,s1,s2,s3,s4,s5","SLEEP_SECONDS":0.0,"KEEP_GOING":False,"FORCE_S1":False}
     if CFG.exists():
         cfg=json.loads(CFG.read_text(encoding="utf-8"))
         p=cfg.get("PIPELINE") or {}

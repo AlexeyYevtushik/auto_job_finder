@@ -9,8 +9,9 @@
 # 4) Respects config/config.json for HEADFUL, LIMIT, FAIL_FAST, cookies, timeouts, etc.
 #
 # IMPORTANT FIXES:
-# - Added robust JSONL reader (supports pretty-printed multi-line JSON objects).
-# - get_pending_rows() and update_row_inplace() now use the robust reader.
+# - Robust JSONL reader (supports pretty-printed multi-line JSON objects).
+# - Updates to filtered_links.jsonl preserve original formatting & structure.
+# - New fields are added as a NEW LINE before closing "}" (no repacking).
 # - Fixed outdated patch: {"outdated": True, "processed": True}.
 # - Fixed minor JS typos (&& instead of 'and') in evaluate() snippets.
 # -----------------------------------------------------------------------------
@@ -36,7 +37,7 @@ INPUT_JSONL = DATA_DIR / "filtered_links.jsonl"
 CONFIG_PATH = Path("config/config.json")
 
 
-# ------------------------------- Utils & IO ----------------------------------
+# ------------------------------- Logging -------------------------------------
 
 def log(msg: str) -> None:
     print(f"[S4] {msg}", flush=True)
@@ -47,6 +48,8 @@ def step(tag: str, msg: str) -> None:
 def safe_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", s or "item")
 
+
+# ------------------------------- Config --------------------------------------
 
 def load_config() -> Dict[str, Any]:
     """Load config/config.json or fall back to defaults."""
@@ -67,22 +70,12 @@ def load_config() -> Dict[str, Any]:
         return json.load(f)
 
 
-def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    """Rewrite a JSONL file (one compact JSON per line)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            if isinstance(r, dict):
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
+# --------------------------- Robust JSONL Reader -----------------------------
 
 def _robust_iter_json_objects(p: Path) -> Iterable[Dict[str, Any]]:
     """
-    Robustly stream JSON objects from a file where objects may be:
-    - one per line (.jsonl), or
-    - pretty-printed across multiple lines, back-to-back.
-
-    This solves the "no pending rows" issue when filtered_links.jsonl is formatted with indentation.
+    Robustly stream JSON objects from a file where objects may be one-per-line or
+    pretty-printed across multiple lines back-to-back. Yields dicts.
     """
     if not p.exists():
         return
@@ -119,14 +112,12 @@ def _robust_iter_json_objects(p: Path) -> Iterable[Dict[str, Any]]:
                     try:
                         obj, idx = dec.raw_decode(s)
                     except Exception:
-                        # keep accumulating if not decodable yet
                         continue
                     if isinstance(obj, dict):
                         yield obj
                     rest = s[idx:].lstrip()
                     buf = list(rest) if rest else []
 
-        # trailing remainder
         if any(c.strip() for c in buf):
             s = "".join(buf).strip()
             try:
@@ -138,7 +129,6 @@ def _robust_iter_json_objects(p: Path) -> Iterable[Dict[str, Any]]:
 
 
 def _coerce_row(obj: Any) -> Optional[Dict[str, Any]]:
-    """Accept dict or JSON string; ignore anything else."""
     if isinstance(obj, dict):
         return obj
     if isinstance(obj, str):
@@ -166,23 +156,6 @@ def match_row(r: Dict[str, Any], key_id, val_id, key_url, val_url) -> bool:
     return False
 
 
-def update_row_inplace(match_id_key: str, match_id_val, match_url_key: str, match_url_val, patch: Dict[str, Any]) -> bool:
-    """
-    Read the entire filtered_links.jsonl robustly, update the first matching row with 'patch',
-    and rewrite the file (compact JSONL). Do NOT touch other fields.
-    """
-    rows = [r for r in (_coerce_row(x) for x in _robust_iter_json_objects(INPUT_JSONL)) if r is not None]
-    updated = False
-    for r in rows:
-        if match_row(r, match_id_key, match_id_val, match_url_key, match_url_val):
-            r.update(patch)
-            updated = True
-            break
-    if updated:
-        write_jsonl(INPUT_JSONL, rows)
-    return updated
-
-
 def get_pending_rows(limit: int) -> List[Dict[str, Any]]:
     """
     Pending rows = easy_apply == true AND processed == false.
@@ -198,6 +171,194 @@ def get_pending_rows(limit: int) -> List[Dict[str, Any]]:
     if limit and limit > 0:
         return pending[:limit]
     return pending
+
+
+# ---------------- JSONL in-place updater (preserve formatting/structure) ----------------
+
+def _iter_json_objects_with_spans(p: Path) -> Iterable[Tuple[Dict[str, Any], int, int, str]]:
+    """
+    Extract objects as raw text with start/end offsets from the whole file text.
+    Supports pretty-printed multi-line JSON objects back-to-back.
+    Yields: (obj_dict, start_idx, end_idx, raw_text)
+    """
+    if not p.exists():
+        return
+    text = p.read_text(encoding="utf-8")
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if text[i] != "{":
+            i += 1
+            continue
+        start = i
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+            j += 1
+        raw = text[start:j]
+        try:
+            obj = json.loads(raw)
+            yield obj, start, j, raw
+        except Exception:
+            i = start + 1
+            continue
+        i = j
+
+
+def _replace_key_value_in_raw(raw: str, key: str, new_val: Any) -> Tuple[str, bool]:
+    """
+    Replace existing key's value in raw object text without reformatting other parts.
+    Returns (new_raw, replaced).
+    """
+    k = re.escape(key)
+    # Very permissive value matcher to handle JSON literals/strings/arrays/objects
+    pat = re.compile(
+        rf'(" {k} "|\b"{k}")\s*:\s*(?P<val>(?:true|false|null|"(?:\\.|[^"\\])*"|[-\d.eE]+|\[.*?\]|\{{.*?\}}))',
+        re.S
+    )
+
+    def _dump_js(v: Any) -> str:
+        return json.dumps(v, ensure_ascii=False)
+
+    m = pat.search(raw)
+    if not m:
+        return raw, False
+
+    start, end = m.start("val"), m.end("val")
+    new_literal = _dump_js(new_val)
+    new_raw = raw[:start] + new_literal + raw[end:]
+    return new_raw, True
+
+
+def _append_key_value_line(raw: str, key: str, val: Any) -> str:
+    """
+    Insert a new `"key": value` line before the closing '}'.
+    Keeps indentation, adds comma to previous field if needed.
+    Works for both single-line and multi-line objects.
+    """
+    close_idx = raw.rfind("}")
+    if close_idx == -1:
+        return raw
+
+    before = raw[:close_idx]
+    is_single_line = ("\n" not in raw)
+    new_val = json.dumps(val, ensure_ascii=False)
+
+    # Decide if previous item needs a trailing comma
+    stripped = before.rstrip()
+    needs_comma = not stripped.endswith(("{", ","))
+
+    if is_single_line:
+        prefix = raw[:close_idx].rstrip()
+        suffix = raw[close_idx:]
+        if needs_comma and not prefix.endswith("{"):
+            prefix += ", "
+        else:
+            prefix += " "
+        insert = f'"{key}": {new_val} '
+        return prefix + insert + suffix
+
+    # Multiline object: compute indentation
+    lines = before.splitlines()
+    last_content_line = ""
+    for ln in reversed(lines):
+        if ln.strip():
+            last_content_line = ln
+            break
+    indent_field = re.match(r"\s*", last_content_line).group(0) if last_content_line else "  "
+
+    if needs_comma:
+        idx_last = before.rfind(last_content_line)
+        if idx_last != -1:
+            if not last_content_line.rstrip().endswith((",", "{")):
+                patched_line = last_content_line.rstrip() + ","
+                before = before[:idx_last] + patched_line + before[idx_last + len(last_content_line):]
+
+    newline = "\n"
+    insertion = f'{newline}{indent_field}"{key}": {new_val}{newline}'
+    new_raw = before + insertion + raw[close_idx:]
+    return new_raw
+
+
+def _patch_object_raw(raw: str, patch: Dict[str, Any]) -> str:
+    # First, try replacing existing keys; collect missing keys to add
+    to_add: Dict[str, Any] = {}
+    for k, v in patch.items():
+        new_raw, replaced = _replace_key_value_in_raw(raw, k, v)
+        if replaced:
+            raw = new_raw
+        else:
+            to_add[k] = v
+    # Then, add missing keys as a new line each
+    for k, v in to_add.items():
+        raw = _append_key_value_line(raw, k, v)
+    return raw
+
+
+def update_row_inplace_preserving_format(
+    match_id_key: str,
+    match_id_val,
+    match_url_key: str,
+    match_url_val,
+    patch: Dict[str, Any],
+    path: Path = INPUT_JSONL
+) -> bool:
+    """
+    Update the FIRST matching object by id/url with patch:
+      - existing keys -> replace only value (preserving spaces/commas)
+      - missing keys  -> add as NEW LINE before '}' with correct comma/indent
+    The rest of the file (including other objects and whitespace) remains intact.
+    """
+    if not path.exists():
+        return False
+
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    pieces: List[str] = []
+    cursor = 0
+
+    for obj, start, end, raw in _iter_json_objects_with_spans(path):
+        if changed:
+            continue
+        if match_row(obj, match_id_key, match_id_val, match_url_key, match_url_val):
+            pieces.append(text[cursor:start])  # prefix
+            patched = _patch_object_raw(raw, patch)
+            pieces.append(patched)
+            cursor = end
+            changed = True
+
+    if not changed:
+        return False
+
+    pieces.append(text[cursor:])  # tail
+    new_text = "".join(pieces)
+    path.write_text(new_text, encoding="utf-8")
+    return True
 
 
 # ----------------------------- Page helpers ----------------------------------
@@ -933,17 +1094,14 @@ async def open_application_form(page: Page, allow_cookie_click: bool, allow_same
         with suppress(Exception):
             await maybe_accept_cookies(page)
 
-    # If form already present
     pre = await find_form_scope(page)
     if pre:
         step("FORM", "true form already visible -> OK")
         return True, pre
 
-    # Try to find an opener on the job page
     opener = await find_page_apply_opener(page)
     if not opener:
         step("FORM", "opener not found -> cannot open form")
-        # Allow a short wait in case form appears dynamically without clicking an opener
         for i in range(1, 11):
             pre2 = await find_form_scope(page)
             if pre2:
@@ -952,7 +1110,6 @@ async def open_application_form(page: Page, allow_cookie_click: bool, allow_same
             await asyncio.sleep(0.5)
         return False, page
 
-    # Try popup first (common on some providers)
     step("FORM", "opener found -> try popup click")
     popup: Optional[Page] = None
     try:
@@ -984,7 +1141,6 @@ async def open_application_form(page: Page, allow_cookie_click: bool, allow_same
         step("FORM", "true application form did not appear in popup")
         return False, popup
 
-    # Same-page opener
     if not allow_samepage_opener:
         step("FORM", "no popup; same-page opener disallowed -> waiting for form without clicking")
         for i in range(1, 11):
@@ -1030,7 +1186,6 @@ async def process_one(
     if not (row.get("easy_apply") is True and row.get("processed") is False):
         return
 
-    # Navigate to the job URL (for in-page JustJoin forms, 'url' is correct)
     url = row.get("url")
     if not url:
         return
@@ -1069,17 +1224,14 @@ async def process_one(
             with suppress(Exception):
                 await maybe_accept_cookies(base_page)
 
-        # If neither opener nor pre-visible form is present, mark as outdated
         pre_form = await find_form_scope(base_page)
         if not pre_form:
             opener_probe = await find_page_apply_opener(base_page)
             if opener_probe is None:
                 step("APPLY", "no opener -> mark outdated & processed")
-                # IMPORTANT: processed=True (previous code mistakenly used 'false')
-                update_row_inplace(id_key, id_val, url_key, url_val, {"outdated": True, "processed": True})
+                update_row_inplace_preserving_format(id_key, id_val, url_key, url_val, {"outdated": True, "processed": True}, INPUT_JSONL)
                 return
 
-        # Try to open the form
         step("FORM", "open: start")
         form_open, active_scope = await open_application_form(
             base_page,
@@ -1090,12 +1242,10 @@ async def process_one(
         if not form_open or not active_scope:
             raise RuntimeError("Could not open a TRUE application form (opener not clicked or form not shown)")
 
-        # Fill "Introduce yourself" (best-effort)
         step("FILL", "introduce-yourself: start")
         log_row["s4_introduce_filled"] = await fill_introduce_yourself(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'OK' if log_row['s4_introduce_filled'] else 'not found'}")
 
-        # Verify it actually contains our text
         step("FILL", "introduce-yourself: verify")
         log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         if not log_row["s4_intro_verified"] and log_row["s4_introduce_filled"]:
@@ -1105,7 +1255,6 @@ async def process_one(
             log_row["s4_intro_verified"] = await wait_intro_confirmed(active_scope, intro_text)
         step("FILL", f"introduce-yourself: {'VERIFIED' if log_row['s4_intro_verified'] else 'NOT VERIFIED'}")
 
-        # Best-effort: set positive selects & tick consents
         step("FILL", "positive-selects: start")
         log_row["s4_selects_set"] = await set_positive_selects_if_present(active_scope)
         step("FILL", f"positive-selects: set={log_row['s4_selects_set']}")
@@ -1114,7 +1263,6 @@ async def process_one(
         log_row["s4_consents_ticked"] = await tick_consents_if_present(active_scope)
         step("FILL", f"consents: ticked={log_row['s4_consents_ticked']}")
 
-        # Quick path: if intro verified, try submit immediately
         if log_row["s4_intro_verified"]:
             step("SUBMIT", "try submit immediately")
             quick_clicked = await click_final_apply_in_form(active_scope)
@@ -1125,7 +1273,6 @@ async def process_one(
                 log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
                 step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
 
-        # If still not confirmed, check readiness, then try again
         if not log_row["s4_submit_clicked"] and not log_row["s4_confirmation"]:
             step("SUBMIT", "readiness check: start")
             ready, ready_report = await is_form_ready_to_submit(active_scope)
@@ -1157,25 +1304,23 @@ async def process_one(
                 if not log_row["s4_confirmation"]:
                     step("CONFIRM", "wait: start")
                     log_row["s4_confirmation"] = await wait_for_confirmation(active_scope)
-                    step("CONFIRM", f"result: {'OK' if log_row["s4_confirmation"] else 'NO CONFIRMATION'}")
+                    step("CONFIRM", f"result: {'OK' if log_row['s4_confirmation'] else 'NO CONFIRMATION'}")
 
         if log_row["s4_confirmation"]:
             step("ROW", f"Application Completed -> {rid}")
 
-        # Patch row with latest telemetry; mark processed only on confirmation
         patch = {**log_row}
         if log_row["s4_confirmation"]:
             patch["processed"] = True
 
-        updated = update_row_inplace(id_key, id_val, url_key, url_val, patch)
+        updated = update_row_inplace_preserving_format(id_key, id_val, url_key, url_val, patch, INPUT_JSONL)
         if not updated:
             step("WARN", "row patch did not match any record (check id/url).")
 
     except Exception as e:
         log_row["s4_error"] = f"{type(e).__name__}: {e}"
         step("ERROR", log_row["s4_error"])
-        # Save error telemetry
-        update_row_inplace(id_key, id_val, url_key, url_val, {**log_row})
+        update_row_inplace_preserving_format(id_key, id_val, url_key, url_val, {**log_row}, INPUT_JSONL)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ERRORS_DIR.mkdir(parents=True, exist_ok=True)
