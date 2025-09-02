@@ -1,6 +1,9 @@
-# src/s0_apply_manual_flags.py
-# Read data/manual_work.jsonl and for each record with processed==true, find a matching record
-# in data/filtered_links.jsonl (match by id AND final_url) and set its processed field to true.
+# src/s0_apply_manual_overlays.py
+# Накладывает поля из data/manual_work.jsonl на соответствующие объекты
+# в data/filtered_links.jsonl по (id, final_url).
+# - Обновляет существующие значения.
+# - Добавляет новые поля (каждое на новой строке из-за indent=1).
+# - Порядок объектов и их набор сохраняются (только значения/новые ключи).
 
 from pathlib import Path
 import json
@@ -48,15 +51,14 @@ def write_jsonl_pretty(p: Path, rows: List[Dict[str, Any]]) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as f:
         for r in rows:
+            # indent=1 -> каждый ключ/новый параметр на новой строке
             f.write(json.dumps(r, ensure_ascii=False, indent=1) + "\n")
     tmp.replace(p)
 
 def main():
     if not MANUAL.exists():
-        # Finish normally without error if manual_work.jsonl is missing
-        print(f"[S0] {MANUAL} not found. Skipping manual flag application.")
+        print(f"[S0] {MANUAL} not found. Skipping overlays.")
         return
-
     if not FILTERED.exists():
         print(f"[S0] Missing {FILTERED}", file=sys.stderr)
         sys.exit(1)
@@ -64,30 +66,43 @@ def main():
     manual_rows = load_jsonl(MANUAL)
     filtered_rows = load_jsonl(FILTERED)
 
-    # Build set of (id, final_url) pairs from manual where processed==True
-    targets: set[Tuple[str, str]] = set()
+    # Подготовим “оверлеи” по (id, final_url)
+    overlays: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for m in manual_rows:
-        if m.get("processed") is True:
-            mid = (m.get("id") or "").strip()
-            mfinal = (m.get("final_url") or "").strip()
-            if mid and mfinal:
-                targets.add((mid, mfinal))
+        mid = (m.get("id") or "").strip()
+        mfinal = (m.get("final_url") or "").strip()
+        if not mid or not mfinal:
+            continue
+        # Берём все поля, кроме ключей для матчинга
+        ov = {k: v for k, v in m.items() if k not in ("id", "final_url")}
+        if not ov:
+            continue
+        # Последняя запись в manual по паре перекрывает предыдущие
+        overlays[(mid, mfinal)] = ov
 
-    if not targets:
-        print("[S0] No manual records with processed=true. Nothing to update.")
+    if not overlays:
+        print("[S0] No overlays to apply. Nothing to update.")
         return
 
-    updated = 0
+    updated_count = 0
+    changed_rows = 0
     for r in filtered_rows:
-        rid = (r.get("id") or "").strip()
-        rfinal = (r.get("final_url") or "").strip()
-        if (rid, rfinal) in targets and r.get("processed") is not True:
-            r["processed"] = True
-            updated += 1
+        key = ((r.get("id") or "").strip(), (r.get("final_url") or "").strip())
+        ov = overlays.get(key)
+        if not ov:
+            continue
+        before = json.dumps(r, ensure_ascii=False, sort_keys=False)
+        # Накладываем только значения (обновляем/добавляем ключи)
+        for k, v in ov.items():
+            r[k] = v
+        after = json.dumps(r, ensure_ascii=False, sort_keys=False)
+        if before != after:
+            changed_rows += 1
+            updated_count += len(ov)
 
-    if updated > 0:
+    if changed_rows > 0:
         write_jsonl_pretty(FILTERED, filtered_rows)
-        print(f"[S0] Updated processed=true for {updated} record(s) in {FILTERED}")
+        print(f"[S0] Applied overlays for {changed_rows} object(s); updated/added {updated_count} field(s).")
     else:
         print("[S0] No matching records needed updates.")
 
