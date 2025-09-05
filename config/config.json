@@ -1,7 +1,6 @@
 {
   "JOB_NAMES": ["QA Automation"],
   "KEYWORDS": ["Playwright", "Python", "JavaScript/TypeScript"],
-  "INTRODUCE_YOURSELF": "Github: https://github.com/AlexeyYevtushik\nLinkedIn: https://www.linkedin.com/in/alexey-yevtushik/",
   
   "LOCATIONS": [ "remote"], 
   "SHORT_TIMEOUT_MIN": 0,
@@ -17,7 +16,7 @@
   "ALLOW_COOKIE_CLICK": true,
   "ALLOW_SAMEPAGE_OPENER": false,
   "PIPELINE": {
-    "SEQ": "s1,s2x2,s3,s4,s5,s6",
+    "SEQ": "s1,s2x2,s3,s5",
     "SLEEP_SECONDS": 60,
     "KEEP_GOING": false,
     "FORCE_S1": false
