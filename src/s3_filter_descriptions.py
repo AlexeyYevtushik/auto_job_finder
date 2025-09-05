@@ -2,18 +2,22 @@
 # Purpose: Filter job descriptions and detect easy apply (S3 async worker).
 # Behavior:
 # - Reads new_href=true links, visits pages, extracts/cleans description,
-#   finds keywords, detects Apply flow (modal vs popup/navigation).
-# - Writes results into filtered_links.jsonl in pretty multi-line JSON format.
-# - IMPORTANT: Uses "upsert" semantics:
-#     * If record with same id (and optional same final_url) exists -> update ONLY values
-#       (shallow merge), keep object (conceptually) the same.
-#     * If not found -> append as a new pretty JSON object.
+#   finds keywords, detects Apply flow with the following priority:
+#     1) Look for "1-click Apply": if present -> click, wait for "Application Completed".
+#        On success => easy_apply=true, processed=true.
+#     2) Otherwise click normal "Apply" and WAIT ONLY for a NEW TAB (popup).
+#        If new tab appears => final_url=<new tab url>, easy_apply=false, processed=false.
+#        If no new tab => easy_apply=false, processed=false (mode='no_new_tab').
+# - If no Apply button at all => processed=true, outdated=true.
+#
+# - Writes results into filtered_links.jsonl using **one line per JSON object**.
+# - IMPORTANT: Upsert semantics (shallow merge) with forced key order on write.
 # - File I/O details:
-#     * JSONL is multi-line per object; we stream objects safely,
-#       rewrite to a temp file for updates, then atomically replace.
-#     * Each object and each field is written on its own line (indent=1).
+#     * JSONL is strictly one object per line; no pretty/multi-line support.
+#     * Updates are done via a temp file + atomic replace for safety.
+# - Field order in every written/updated line:
+#     * final_url, (other keys), url, description_sample
 # -----------------------------------------------------------------------------
-
 
 import asyncio
 import json
@@ -34,7 +38,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from .common import (
     DATA_DIR, ERRORS_DIR, SCREENSHOTS_DIR,
     LINKS_JSONL, FILTERED_JSONL, STORAGE_STATE_JSON,
-    read_jsonl, append_jsonl,  # kept import; we override with pretty/upsert below
+    read_jsonl, append_jsonl,  # we keep these imports; only single-line JSONL is used
     now_iso, human_sleep
 )
 
@@ -43,109 +47,122 @@ DEFAULT_KEYWORDS = ["python", "playwright", "javascript", "typescript"]
 
 # ------------------------------- Logging -------------------------------------
 
-
 def _log(msg: str) -> None:
     print(f"[S3] {msg}", flush=True)
-
 
 def safe_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)
 
 
-# ---------------------- Pretty JSONL write + UPSERT --------------------------
-# Rationale:
-# - We must not "recreate" objects semantically: only update field values or add new fields.
-# - JSONL has one (multi-line) JSON object per logical row.
-# - To update an existing object, we stream-read objects, shallow-merge updates into the
-#   matched object, write all objects into a temporary file, then atomically replace source.
-# - For append, we simply append a pretty JSON object.
+# ------------------------- One-line JSONL + UPSERT ---------------------------
 
+_SPECIAL_FIRST = "final_url"
+_SPECIAL_MID_LAST = ("url", "description_sample")
 
-def _iter_multiline_jsonl(p: Path):
-    """Yield JSON objects from a JSONL file where each object is multi-line pretty JSON."""
+def _ordered_for_dump(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a new dict ordered as:
+      - final_url (if present)
+      - all other keys in their current relative order (excluding special)
+      - url (if present)
+      - description_sample (if present)
+    """
+    out: Dict[str, Any] = {}
+    if _SPECIAL_FIRST in d:
+        out[_SPECIAL_FIRST] = d[_SPECIAL_FIRST]
+    for k, v in d.items():
+        if k == _SPECIAL_FIRST or k in _SPECIAL_MID_LAST:
+            continue
+        out[k] = v
+    for k in _SPECIAL_MID_LAST:
+        if k in d:
+            out[k] = d[k]
+    return out
+
+def _dump_one_line(obj: Dict[str, Any]) -> str:
+    """Dump object as a single-line JSON string with enforced key order."""
+    return json.dumps(_ordered_for_dump(obj), ensure_ascii=False)
+
+def _iter_jsonl_one_line(p: Path):
+    """
+    Yield dicts from a JSONL file where each line is exactly one JSON object.
+    Lines that fail to parse are skipped.
+    """
     if not p.exists():
         return
-    decoder = json.JSONDecoder()
-    buf = ""
     with p.open("r", encoding="utf-8", newline="\n") as f:
         for line in f:
-            buf += line
-            try:
-                # Try to decode from the first non-space
-                lead = len(buf) - len(buf.lstrip())
-                obj, idx = decoder.raw_decode(buf.lstrip())
-                # Leftover (if any) stays in buffer
-                buf = buf[lead + idx:]
-                yield obj
-            except json.JSONDecodeError:
-                # Not a full JSON yet; keep accumulating lines
+            s = line.strip()
+            if not s:
                 continue
-    # If buf has only whitespace, it's fine; otherwise it's a trailing error.
-    if buf.strip():
-        raise ValueError("Trailing non-JSON content at the end of file.")
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception:
+                # Skip malformed lines rather than fail the whole run
+                continue
 
-
-def _write_pretty_jsonl_row(fh, obj: Dict[str, Any]) -> None:
-    """Pretty-print one JSON object with indent=1 and a trailing newline."""
-    fh.write(json.dumps(obj, ensure_ascii=False, indent=1) + "\n")
-
-
-def _shallow_merge(obj: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
-    """Shallow merge: update/add only top-level keys (no deep merge)."""
-    for k, v in patch.items():
-        obj[k] = v
-    return obj
-
-
-def _upsert_filtered_record(record: Dict[str, Any], match_by_final_url: bool = False) -> None:
+def _upsert_filtered_record_oneline(record: Dict[str, Any], match_by_final_url: bool = False) -> None:
     """
-    Upsert into FILTERED_JSONL:
-      - If existing object with same 'id' (and optionally same 'final_url') is found:
-          shallow-merge 'record' into it (update values / add keys).
-      - Else: append a new pretty JSON object.
-    Constraints:
-      - Keep multi-line format (indent=1) so each field appears on its own line.
-      - Use atomic replace on update for safety.
+    Upsert into FILTERED_JSONL (one-line objects):
+      - If existing line with same 'id' (and optionally same 'final_url') is found:
+          shallow-merge 'record' into it, then replace that line with ordered single-line JSON.
+      - Else: append a new single-line JSON object at the end.
+    Atomic replace is used on update for safety.
     """
     path = Path(FILTERED_JSONL)
     rec_id = str(record.get("id") or "")
     rec_final_url = str(record.get("final_url") or "")
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        # First write: just append pretty
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as fh:
-            _write_pretty_jsonl_row(fh, record)
+        with path.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_dump_one_line(record) + "\n")
         return
 
     found = False
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as tmp:
+    with path.open("r", encoding="utf-8", newline="\n") as src, \
+         tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", delete=False) as tmp:
         tmp_path = Path(tmp.name)
-        for obj in _iter_multiline_jsonl(path):
-            oid = str(obj.get("id") or "")
-            o_final = str(obj.get("final_url") or "")
-            is_match = (oid == rec_id) and (o_final == rec_final_url if match_by_final_url else True)
-            if is_match and not found:
-                # Update values only; keep the object logically the same
-                obj = _shallow_merge(obj, record)
-                found = True
-            _write_pretty_jsonl_row(tmp, obj)
+        for line in src:
+            raw = line.rstrip("\n")
+            s = raw.strip()
+            if not s:
+                # preserve blank lines if any
+                tmp.write(line)
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                # keep malformed lines untouched
+                tmp.write(line)
+                continue
+
+            if isinstance(obj, dict) and not found:
+                oid = str(obj.get("id") or "")
+                o_final = str(obj.get("final_url") or "")
+                is_match = (oid == rec_id) and (o_final == rec_final_url if match_by_final_url else True)
+                if is_match:
+                    obj.update(record)  # shallow merge
+                    tmp.write(_dump_one_line(obj) + "\n")
+                    found = True
+                    continue
+
+            # non-matching line: copy as-is
+            tmp.write(line)
 
         if not found:
-            # Append the new record at the end
-            _write_pretty_jsonl_row(tmp, record)
+            tmp.write(_dump_one_line(record) + "\n")
 
-    # Atomic replace
     shutil.move(str(tmp_path), str(path))
 
 
 # ----------------------------- Keyword helpers -------------------------------
 
-
 def _normalize_keyword_token(tok: str) -> List[str]:
     parts = re.split(r"[,\s/]+", tok)
     return [p.strip().lower() for p in parts if p.strip()]
-
 
 def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
     toks: List[str] = []
@@ -163,7 +180,6 @@ def normalize_keywords(src: Union[str, List[str], None]) -> List[str]:
             out.append(t)
     return out or DEFAULT_KEYWORDS[:]
 
-
 def find_keywords(text: str, keywords: List[str]) -> Tuple[bool, List[str]]:
     text_l = text.lower()
     matched = [kw for kw in keywords if kw in text_l]
@@ -171,7 +187,6 @@ def find_keywords(text: str, keywords: List[str]) -> Tuple[bool, List[str]]:
 
 
 # ------------------------------- Page helpers --------------------------------
-
 
 async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: int = 120, pause_s: float = 3.6):
     for _ in range(max_steps):
@@ -190,7 +205,6 @@ async def slow_scroll_page_to_bottom(page: Page, step_px: int = 400, max_steps: 
             break
         await asyncio.sleep(pause_s)
 
-
 async def get_job_description_text(page: Page) -> str:
     try:
         blocks = page.locator("xpath=//h2/../../")
@@ -201,7 +215,7 @@ async def get_job_description_text(page: Page) -> str:
                 blk = blocks.nth(i)
                 with suppress(Exception):
                     await blk.scroll_into_view_if_needed()
-                # Nudge viewport to ensure content is fully rendered
+                # nudge rendering
                 for _ in range(40):
                     try:
                         handle = await blk.element_handle()
@@ -268,107 +282,83 @@ async def get_job_description_text(page: Page) -> str:
     return ""
 
 
-def _is_justjoin(url: str) -> bool:
+# ---------------------- One-click Apply + completion helpers ------------------
+
+_ONECLICK_RX = re.compile(
+    r"\b(?:1[\-\u2011\u2013\u2014]?\s*click|one\s*click)\s*apply\b",
+    re.I
+)
+
+# Completion signals. Keep liberal to handle toasts and dialogs in EN/PL.
+_APP_DONE_RX = re.compile(
+    r"(application (?:completed|complete|sent|submitted)|"
+    r"(?:thanks|thank you).{0,40}(?:applic)|"
+    r"(?:dziękujemy|wysłano|złożono).{0,40}(?:aplikacj))",
+    re.I
+)
+
+async def find_one_click_apply(page: Page):
+    """Find a '1-click Apply' CTA by role-first + fallback text filters."""
+    # Role-first (most robust)
+    for role in ("button", "link"):
+        loc = page.get_by_role(role, name=_ONECLICK_RX)
+        if await loc.count() > 0:
+            return loc.first
+
+    # Generic fallbacks
+    candidates = ["button", "a", "[data-testid]", "[data-test]", "[aria-label]"]
+    for sel in candidates:
+        loc = page.locator(sel).filter(has_text=_ONECLICK_RX)
+        if await loc.count() > 0:
+            return loc.first
+    return None
+
+async def wait_application_completed(page: Page, timeout_ms: int = 20000) -> bool:
+    """
+    Wait for a visible signal that application has been completed/submitted.
+    We search the entire document for matching text (toast/dialog/inline).
+    """
     try:
-        host = (urlparse(url).netloc or "").lower()
-        return host.endswith("justjoin.it")
+        await page.wait_for_function(
+            """(rx) => {
+                const re = new RegExp(rx, 'i');
+                const scan = (node) => {
+                  if (!node) return false;
+                  const txt = (node.innerText || node.textContent || '').trim();
+                  if (txt && re.test(txt)) return true;
+                  for (const el of (node.querySelectorAll?.('*') || [])) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t && re.test(t)) return true;
+                  }
+                  return false;
+                };
+                return scan(document.body);
+            }""",
+            arg=_APP_DONE_RX.pattern,
+            timeout=timeout_ms
+        )
+        return True
     except Exception:
-        return False
-
-
-async def detect_jj_easy_apply_modal(page: Page) -> bool:
-    if not _is_justjoin(page.url or ""):
-        return False
-    try:
-        dlg = page.locator("[role='dialog']")
-        if await dlg.count() == 0:
-            dlg = page.locator("div[aria-modal='true']")
-        if await dlg.count() == 0:
-            return False
-        has_heading = await dlg.filter(has_text=re.compile(r"Application form|Formularz aplikacyjny", re.I)).count() > 0
-        has_form = await dlg.locator("form").count() > 0
-        has_apply = await dlg.locator("button:has-text('Apply'), button:has-text('Aplikuj')").count() > 0
-        hint_intro = await dlg.locator("textarea[placeholder*='Introduce yourself' i]").count() > 0
-        hint_name = await dlg.filter(has_text=re.compile(r"First and last name|Imię i nazwisko", re.I)).count() > 0
-        hint_mail = await dlg.filter(has_text=re.compile(r"Email", re.I)).count() > 0
-        score = sum([has_heading, has_form, has_apply, hint_intro, (hint_name or hint_mail)])
-        return has_form and has_apply and score >= 3
-    except Exception:
-        return False
-
-
-async def detect_easy_apply_modal(page: Page) -> bool:
-    try:
-        dlg = page.locator("[role='dialog'], div[aria-modal='true'], .modal, .Dialog, .dialog, [class*='modal']")
-        if await dlg.count() == 0:
-            return False
-        dlg = dlg.first
-        has_form = await dlg.locator("form").count() > 0
-        has_inputs = (await dlg.locator("input[type='email'], input[type='text'], input[type='file'], textarea").count()) > 0
-        has_cv = (await dlg.locator("input[type='file'], [data-testid*='cv' i], [data-test*='cv' i]").count()) > 0
-        text_hits = await dlg.filter(
-            has_text=re.compile(
-                r"(apply|send application|submit application|application form|confirm application|"
-                r"aplikuj|wyślij|formularz aplikacyjny|złóż aplikację)",
-                re.I,
+        # As a fallback, quickly check common containers
+        try:
+            dlg = page.locator(
+                "[role='dialog'], [aria-modal='true'], .modal, .dialog, "
+                "[class*='toast' i], [class*='notification' i]"
             )
-        ).count() > 0
-        has_submit_btn = (
-            await dlg.locator(
-                "button:has-text('Apply'), button:has-text('Submit'), button:has-text('Send'), "
-                "button:has-text('Aplikuj'), button:has-text('Wyślij')"
-            ).count()
-        ) > 0
-        score = sum([has_form, has_inputs, text_hits, has_submit_btn]) + (1 if has_cv else 0)
-        return score >= 3
-    except Exception:
+            if await dlg.count() > 0:
+                match = await dlg.filter(has_text=_APP_DONE_RX).count()
+                return match > 0
+        except Exception:
+            pass
         return False
-
-
-# ------------------ Description cleaning to visible rows ---------------------
-
-
-import re as _re
-
-
-def _strip_invisibles(text: str) -> str:
-    if not text:
-        return ""
-    return _re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
-
-
-def _slice_between_markers(lines: List[str]) -> List[str]:
-    """
-    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
-    Case-insensitive. If 'All offers' missing -> return original. If 'Apply' missing -> keep to end.
-    """
-    norm = [ln.strip() for ln in lines]
-    try:
-        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
-    except StopIteration:
-        return lines
-    end = None
-    for j in range(start + 1, len(norm)):
-        if norm[j].lower() == "apply":
-            end = j
-            break
-    return lines[start:end] if end is not None else lines[start:]
-
-
-def to_visible_rows(text: str) -> List[str]:
-    if not text:
-        return []
-    t = _strip_invisibles(text).replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln.rstrip() for ln in t.split("\n")]
-    lines = _slice_between_markers(lines)
-    lines = [ln.strip() for ln in lines if ln.strip()]
-    return lines
 
 
 # --------------------------- Apply detection flow ----------------------------
 
-
 async def find_apply_button(page: Page):
+    """
+    Generic Apply button (non 1-click). We keep it simple and broad.
+    """
     regexes = [re.compile(pat, re.I) for pat in [
         r"\bapply now?\b", r"\bapply\b", r"\bsubmit application\b", r"\bsend application\b",
         r"\baplikuj\b", r"\bwyślij\b"
@@ -391,7 +381,6 @@ async def find_apply_button(page: Page):
         if await loc.count() > 0:
             return loc.first
     return None
-
 
 async def _extract_probable_href(page: Page, loc) -> Optional[str]:
     with suppress(Exception):
@@ -420,17 +409,58 @@ async def _extract_probable_href(page: Page, loc) -> Optional[str]:
                 return href
     return None
 
-
 async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, Any]:
+    """
+    Detection policy required by the user:
+      1) Try "1-click Apply".
+         - If found, click and wait for "Application Completed".
+           -> easy_apply=true; if completed => processed=true.
+      2) Otherwise click normal "Apply" and WAIT ONLY for a NEW TAB.
+         - If a new tab appears, final_url = new tab URL; easy_apply=false; processed=false.
+         - If no new tab appears in time, return mode='no_new_tab' (no modal/nav handling).
+      3) If no Apply at all, return apply_found=False.
+    """
+    # 1) PRIORITY: 1-click Apply
+    one_click = await find_one_click_apply(page)
+    if one_click:
+        _log("Found 1-click Apply -> clicking")
+        with suppress(Exception):
+            await one_click.scroll_into_view_if_needed()
+            await one_click.hover()
+        clicked = False
+        with suppress(Exception):
+            await one_click.click(no_wait_after=True); clicked = True
+        if not clicked:
+            with suppress(Exception):
+                await one_click.evaluate("el => el.click()"); clicked = True
+
+        app_done = await wait_application_completed(page, timeout_ms=20000)
+        return {
+            "apply_found": True,
+            "one_click": True,
+            "app_completed": bool(app_done),
+            "clicked": clicked,
+            "easy_apply": True,            # 1-click = easy_apply
+            "final_url": page.url or "",
+            "mode": "oneclick_success" if app_done else "oneclick_timeout"
+        }
+
+    # 2) FALLBACK: normal Apply -> WAIT ONLY for a NEW TAB
     apply = await find_apply_button(page)
     if not apply:
         _log(f"[{page.url}] Apply button NOT found")
-        return {"apply_found": False, "clicked": False, "easy_apply": False, "final_url": page.url or "", "mode": "none"}
+        return {
+            "apply_found": False,
+            "one_click": False,
+            "app_completed": False,
+            "clicked": False,
+            "easy_apply": False,
+            "final_url": page.url or "",
+            "mode": "none"
+        }
 
-    _log("Pressing Apply")
-
+    _log("Pressing Apply (expecting a new tab only)")
     pages_before = list(ctx.pages)
-    orig_url = page.url
     pre_href = await _extract_probable_href(page, apply)
 
     with suppress(Exception):
@@ -444,16 +474,9 @@ async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, A
         with suppress(Exception):
             await apply.evaluate("el => el.click()"); clicked = True
 
+    # Wait only for a new tab/popup, not for modal or same-tab navigation
     try:
-        for _ in range(60):  # ~12s
-            try:
-                if await detect_easy_apply_modal(page) or await detect_jj_easy_apply_modal(page):
-                    final_url = page.url or ""
-                    easy = _is_justjoin(final_url)
-                    return {"apply_found": True, "clicked": clicked, "easy_apply": easy, "final_url": final_url, "mode": "modal"}
-            except Exception:
-                pass
-
+        for _ in range(60):  # ~12s total (60 * 200ms)
             new_pages = [p for p in ctx.pages if p not in pages_before]
             if new_pages:
                 new_page = new_pages[0]
@@ -461,38 +484,85 @@ async def click_apply_and_detect(ctx: BrowserContext, page: Page) -> Dict[str, A
                     await new_page.wait_for_load_state("domcontentloaded", timeout=15000)
                 with suppress(Exception):
                     await new_page.wait_for_load_state("networkidle", timeout=8000)
-                final_url = new_page.url or (pre_href or "")
-                if not final_url:
-                    final_url = page.url or ""
-                # popup/new tab → easy_apply = False
-                return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "popup"}
-
-            if (page.url or "") != (orig_url or ""):
-                with suppress(Exception):
-                    await page.wait_for_load_state("domcontentloaded", timeout=8000)
-                with suppress(Exception):
-                    await page.wait_for_load_state("networkidle", timeout=6000)
-                final_url = page.url or ""
-                # same-tab navigation → easy_apply = False
-                return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "nav"}
-
+                final_url = new_page.url or (pre_href or "") or (page.url or "")
+                return {
+                    "apply_found": True,
+                    "one_click": False,
+                    "app_completed": False,
+                    "clicked": clicked,
+                    "easy_apply": False,
+                    "final_url": final_url,
+                    "mode": "popup"
+                }
             await asyncio.sleep(0.2)
 
-        # timeout
+        # No popup/new tab in time -> "no_new_tab"
         final_url = pre_href or (page.url or "")
-        return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "timeout"}
+        return {
+            "apply_found": True,
+            "one_click": False,
+            "app_completed": False,
+            "clicked": clicked,
+            "easy_apply": False,
+            "final_url": final_url,
+            "mode": "no_new_tab"
+        }
     except Exception:
         final_url = pre_href or (page.url or "")
-        return {"apply_found": True, "clicked": clicked, "easy_apply": False, "final_url": final_url, "mode": "error"}
+        return {
+            "apply_found": True,
+            "one_click": False,
+            "app_completed": False,
+            "clicked": clicked,
+            "easy_apply": False,
+            "final_url": final_url,
+            "mode": "error"
+        }
     finally:
+        # Close unexpected extras (if any)
         extras = [p for p in ctx.pages if p not in pages_before and p is not page]
         for p in extras:
             with suppress(Exception):
                 await p.close()
 
 
-# ----------------------------- Link management -------------------------------
+# ------------------ Description cleaning to visible rows ---------------------
 
+import re as _re
+
+def _strip_invisibles(text: str) -> str:
+    if not text:
+        return ""
+    return _re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+
+def _slice_between_markers(lines: List[str]) -> List[str]:
+    """
+    Keep from the FIRST 'All offers' (inclusive) up to BEFORE the NEXT 'Apply' (exclusive).
+    Case-insensitive. If 'All offers' missing -> return original. If 'Apply' missing -> keep to end.
+    """
+    norm = [ln.strip() for ln in lines]
+    try:
+        start = next(i for i, ln in enumerate(norm) if ln.lower() == "all offers")
+    except StopIteration:
+        return lines
+    end = None
+    for j in range(start + 1, len(norm)):
+        if norm[j].lower() == "apply":
+            end = j
+            break
+    return lines[start:end] if end is not None else lines[start:]
+
+def to_visible_rows(text: str) -> List[str]:
+    if not text:
+        return []
+    t = _strip_invisibles(text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    lines = _slice_between_markers(lines)
+    lines = [ln.strip() for ln in lines if ln.strip()]
+    return lines
+
+
+# ----------------------------- Link management -------------------------------
 
 def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,14 +570,12 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-
 def take_new_links(limit: int) -> List[Dict[str, Any]]:
-    all_rows = list(read_jsonl(LINKS_JSONL))
+    all_rows = list(read_jsonl(LINKS_JSONL))  # assumed one-line JSONL reader
     new_rows = [r for r in all_rows if r.get("new_href") is True]
     if limit and limit > 0:
         return new_rows[:limit]
     return new_rows
-
 
 def mark_link_consumed(row: Dict[str, Any]) -> None:
     key = row.get("url") or row.get("id")
@@ -528,7 +596,6 @@ def mark_link_consumed(row: Dict[str, Any]) -> None:
 
 # ------------------------------ Config loading -------------------------------
 
-
 def _load_config() -> Dict[str, Any]:
     cfg_path = os.environ.get("CONFIG", "config/config.json")
     p = Path(cfg_path)
@@ -545,65 +612,78 @@ def _load_config() -> Dict[str, Any]:
 
 # --------------------------------- S3 core -----------------------------------
 
-
 async def process_one(ctx: BrowserContext, row: Dict[str, Any], keywords: List[str], headful: bool, fail_fast: bool) -> bool:
     page: Optional[Page] = None
     url = row.get("url")
     if not url:
         return False
     try:
-        _log(f'New link is processing: "{url}"')
+        _log(f'Processing new link: "{url}"')
         page = await ctx.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         with suppress(Exception):
             await page.wait_for_load_state("networkidle", timeout=8000)
+
+        # Scroll (as requested) before trying to detect the apply flow
         await slow_scroll_page_to_bottom(page)
+
+        # Extract description + keywords
         desc_full = await get_job_description_text(page)
-
-        # CLEAN description into visible rows:
         desc_rows = to_visible_rows(desc_full)
-
         keyword_exists, matched = find_keywords(desc_full, keywords)
 
         # Prepare result (note: final_url initially equals url)
         result = {
             "id": row.get("id"),
             "data_index": row.get("data_index"),
-            "url": url,
-            "final_url": url,
+            "final_url": url,  # order enforced on write
             "keyword_exists": keyword_exists,
             "matched_keywords": matched,
             "easy_apply": False,
-            "description_sample": desc_rows,  # store as list of visible rows
             "processed_at": now_iso(),
             "processed": False,
+            "url": url,  # placed later in ordered dump
+            "description_sample": desc_rows,  # placed last in ordered dump
         }
 
+        # If no keywords -> mark processed=true directly
         if not keyword_exists:
-            # Mark processed=true on non-matching keywords
             result["processed"] = True
-            _upsert_filtered_record(result, match_by_final_url=True)
-            _log("Processed (no keywords)")
+            _upsert_filtered_record_oneline(result, match_by_final_url=True)
+            _log("Processed (no keywords matched)")
             with suppress(Exception):
                 await page.close()
             return True
 
+        # Detect apply path
         info = await click_apply_and_detect(ctx, page)
         result["easy_apply"] = bool(info["easy_apply"])
         result["final_url"] = info["final_url"]
 
+        # No Apply at all -> mark as outdated + processed
         if not info["apply_found"]:
             result["outdated"] = True
             result["processed"] = True
-            _upsert_filtered_record(result, match_by_final_url=False)
-            _log("Processed (apply not found)")
+            _upsert_filtered_record_oneline(result, match_by_final_url=False)
+            _log("Processed (apply not found) -> outdated=true")
             with suppress(Exception):
                 await page.close()
             return True
 
-        # Normal case: upsert collected fields
-        _upsert_filtered_record(result, match_by_final_url=False)
-        _log("Processed")
+        # Successful 1-click completion
+        if info.get("one_click") and info.get("app_completed"):
+            result["processed"] = True
+            _upsert_filtered_record_oneline(result, match_by_final_url=False)
+            _log("Processed (1-click completed)")
+            with suppress(Exception):
+                await page.close()
+            return True
+
+        # Normal Apply branch (WAIT ONLY for a new tab)
+        # - popup/new tab -> final_url already set by detector
+        # - no new tab -> keep processed=False (to be handled in later stages if needed)
+        _upsert_filtered_record_oneline(result, match_by_final_url=False)
+        _log(f"Processed (mode={info.get('mode')})")
 
         # Cleanup extra pages
         for p in list(ctx.pages):
