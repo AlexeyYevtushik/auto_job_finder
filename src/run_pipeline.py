@@ -10,7 +10,6 @@ STATE = ROOT / "data" / "storage_state.json"
 CFG   = ROOT / "config" / "config.json"
 
 CANDIDATES = {
-  "s0": ["s0_apply_manual_flags"],
   "s1": ["s1_prepare","s1_manual_login","s1_login"],
   "s2": ["s2_collect_links"],
   "s3": ["s3_filter_descriptions","s3_scrape_details"],
@@ -40,7 +39,7 @@ def run(mod: str) -> int:
     return subprocess.call([sys.executable,"-m",mod], cwd=str(ROOT))
 
 def load_opts():
-    opts={"SEQ":"s0,s1,s2,s3,s5","SLEEP_SECONDS":0.0,"KEEP_GOING":False,"FORCE_S1":False}
+    opts={"SEQ":"s1,s2,s3,s5","SLEEP_SECONDS":0.0,"KEEP_GOING":False,"FORCE_S1":False}
     if CFG.exists():
         cfg=json.loads(CFG.read_text(encoding="utf-8"))
         p=cfg.get("PIPELINE") or {}
@@ -53,12 +52,6 @@ def load_opts():
 def main():
     o=load_opts(); steps=parse_seq(o["SEQ"])
     # Always ensure s0 runs first (deduplicate if present later)
-    if not steps or steps[0] != "s0":
-        if "s0" in steps:
-            steps = ["s0"] + [s for s in steps if s != "s0"]
-        else:
-            print("[runner] prepending s0 to sequence")
-            steps = ["s0"] + steps
 
     for step in steps:
         if step=="s1" and STATE.exists() and not o["FORCE_S1"]:
